@@ -984,117 +984,125 @@ def build_gamma_figure(gex_df, spot, K_star, F_at_Kstar, ticker, exp_str,
 
 
 # =============================================================================
-# PRICE VIEW  (spot candles + rotated gamma-curve profile sharing the price axis)
+# PRICE VIEW  — VS3D-style net-GEX gradient "cone" field behind the candles
 # =============================================================================
+# Pipeline (per the vs3d spec):
+#   1. density()          per-strike net gamma  ->  smoothed profile on a price grid
+#   2. field_from_profile() 1-D profile -> 2-D tanh "cone" field (90th-pctile scale)
+#   3. imshow the field behind the candles; candles + level lines on top
+# Signed net field -> diverging GEX colormap with BLACK at the midpoint (the
+# zero "seam"): green above the flip / red below.
 
-def build_price_profile_figure(candles, gex_df, levels, title):
+from matplotlib.colors import LinearSegmentedColormap
+
+# exact vs3d GEX colormap (red -> black seam -> green)
+_GEX_CMAP = LinearSegmentedColormap.from_list("vs3d_gex", [
+    (0.00, (0.50, 0.00, 0.00)),
+    (0.34, (0.86, 0.06, 0.06)),
+    (0.47, (0.10, 0.00, 0.00)),
+    (0.50, (0.00, 0.00, 0.00)),
+    (0.53, (0.00, 0.10, 0.00)),
+    (0.66, (0.10, 0.74, 0.18)),
+    (1.00, (0.02, 0.42, 0.06)),
+])
+
+
+def _density(strikes, vals, pg, smooth=0.02):
+    """Per-strike values -> interpolated + gaussian-smoothed profile on price grid pg."""
+    order = np.argsort(strikes)
+    ks = np.asarray(strikes)[order]
+    vs = np.asarray(vals)[order]
+    p = np.interp(pg, ks, vs, left=0.0, right=0.0)
+    sig = len(pg) * smooth
+    return gaussian_filter1d(p, sig) if sig > 0.3 else p
+
+
+def _field_from_profile(vals, n_x=360, gain=4.5):
+    """1-D profile -> 2-D tanh cone field in [-1, 1]. 90th-pctile scaling (never max)."""
+    sc = np.percentile(np.abs(vals), 90) or 1.0
+    b = gaussian_filter1d(0.5 + 0.5 * np.tanh(vals / sc), 2.0)      # normalize -> 0..1
+    xs = np.linspace(0.0, 1.0, n_x)
+    return np.tanh(gain * (b[:, None] - xs[None, :]))              # rows fade across x
+
+
+def build_vs3d_gradient_figure(candles, gex_df, levels, spot, title,
+                               smooth=0.02, gain=4.5, mirror=True):
     """
-    Second view. Left panel: NIFTY spot candlesticks (x = time, y = price).
-    Right panel: the SAME gamma curves from the strike view, rotated 90° into a
-    profile (x = gamma, y = strike) sharing the price axis — so each gamma level
-    lines up horizontally with the candle price it sits at. The curves are kept,
-    not removed.
+    VS3D net-GEX gradient behind spot candles. y = price, x = session clock.
+    The cone tails reach in from the right edge (mirror=True) — the direction
+    you asked for — so strong gamma at a price glows inward toward the candles.
     """
-    from matplotlib.transforms import blended_transform_factory
+    import matplotlib.dates as mdates
 
-    # --- smoothed gamma curves (same construction as the strike view) ---
-    S = gex_df["strike"].to_numpy(dtype=float)
-    if len(S) > 3:
-        sg = 2.0
-        sell_s = gaussian_filter1d(np.abs(gex_df["sell_gamma"].values), sigma=sg)
-        buy_s  = gaussian_filter1d(np.abs(gex_df["buy_gamma"].values), sigma=sg)
-        net_s  = gaussian_filter1d(gex_df["net_gex"].values, sigma=sg)
-        tot_s  = gaussian_filter1d(gex_df["total_gamma"].values, sigma=sg)
-    else:
-        sell_s = np.abs(gex_df["sell_gamma"].values)
-        buy_s  = np.abs(gex_df["buy_gamma"].values)
-        net_s  = gex_df["net_gex"].values
-        tot_s  = gex_df["total_gamma"].values
+    # ---- price grid: spot ±2.5% (min 240 pts), clipped to available strikes ----
+    lo = min(spot * 0.975, float(gex_df["strike"].min()))
+    hi = max(spot * 1.025, float(gex_df["strike"].max()))
+    pg = np.linspace(lo, hi, 240)
 
-    C_SELL, C_BUY, C_NET, C_TOTAL = "#cc0000", "#007700", "#b8860b", "#cc6600"
-    UP, DN = "#137333", "#c5221f"
+    # ---- net gamma per strike, weighted by volume (fallback OI), ×100×spot ----
+    strikes = gex_df["strike"].to_numpy(dtype=float)
+    net = (gex_df["net_gex"].to_numpy(dtype=float))  # already call_gex - put_gex (×100×spot)
+    prof = _density(strikes, net, pg, smooth=smooth)
+    V = _field_from_profile(prof, gain=gain)          # (len(pg), n_x) in [-1, 1]
+    if mirror:
+        V = V[:, ::-1]                                # cone tails come from the RIGHT edge
 
+    # ---- candle x on real date numbers so the field extent matches ----
+    idx = candles.index
+    x = mdates.date2num(idx.to_pydatetime())
+    x0, x1 = float(x[0]), float(x[-1])
+    if x1 <= x0:
+        x1 = x0 + 1.0 / (24 * 60)
+
+    fig, ax = plt.subplots(figsize=(20, 10))
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+
+    ax.imshow(V, origin="lower", extent=[x0, x1, pg[0], pg[-1]], aspect="auto",
+              cmap=_GEX_CMAP, vmin=-1, vmax=1, interpolation="bilinear", zorder=0)
+
+    # ---- candles on top ----
     o = candles["open"].to_numpy(dtype=float)
     h = candles["high"].to_numpy(dtype=float)
     l = candles["low"].to_numpy(dtype=float)
     c = candles["close"].to_numpy(dtype=float)
-    x = np.arange(len(candles))
-    idx = candles.index
-
-    fig = plt.figure(figsize=(22, 11))
-    fig.patch.set_facecolor("white")
-    gs = fig.add_gridspec(1, 2, width_ratios=[3.2, 1.0], wspace=0.03)
-    axc = fig.add_subplot(gs[0, 0])
-    axp = fig.add_subplot(gs[0, 1], sharey=axc)
-    for a in (axc, axp):
-        a.set_facecolor("white")
-
-    # --- candles ---
-    rng = float(np.nanmax(h) - np.nanmin(l)) or 1.0
-    min_body = rng * 0.0008
-    body_w = 0.62
+    bw = (x1 - x0) / max(len(x), 2) * 0.7
     for i in range(len(x)):
-        col = UP if c[i] >= o[i] else DN
-        axc.plot([x[i], x[i]], [l[i], h[i]], color=col, lw=0.9, zorder=3)
-        lo, hi = (o[i], c[i]) if c[i] >= o[i] else (c[i], o[i])
-        axc.add_patch(plt.Rectangle((x[i] - body_w / 2, lo), body_w,
-                                    max(hi - lo, min_body),
-                                    facecolor=col, edgecolor=col, zorder=4))
+        up = c[i] >= o[i]
+        body = "#e8e8e8" if up else "#111111"
+        edge = "#f5f5f5" if up else "#8a8a8a"
+        ax.plot([x[i], x[i]], [l[i], h[i]], color=edge, lw=0.8, zorder=5)
+        lo_b, hi_b = (o[i], c[i]) if up else (c[i], o[i])
+        ax.add_patch(plt.Rectangle((x[i] - bw / 2, lo_b), bw, max(hi_b - lo_b, (hi - l).mean() * 0.02),
+                                   facecolor=body, edgecolor=edge, lw=0.5, zorder=6))
 
-    # --- gamma profile (curves rotated: gamma on x, strike on y) ---
-    axp.axvline(0, color="#555555", lw=1.0, alpha=0.6, zorder=2)
-    axp.fill_betweenx(S, 0, net_s, where=(net_s > 0), facecolor="#22aa22",
-                      alpha=0.15, interpolate=True, zorder=2)
-    axp.fill_betweenx(S, 0, net_s, where=(net_s < 0), facecolor="#ff4444",
-                      alpha=0.15, interpolate=True, zorder=2)
-    axp.plot(tot_s,  S, color=C_TOTAL, lw=2.0, label="Total Gamma", alpha=0.9, zorder=4)
-    axp.plot(buy_s,  S, color=C_BUY,   lw=1.8, label="Buy Gamma",  alpha=0.9, zorder=4)
-    axp.plot(sell_s, S, color=C_SELL,  lw=1.8, label="Sell Gamma", alpha=0.9, zorder=4)
-    axp.plot(net_s,  S, color=C_NET,   lw=2.6, label="Net Gamma",  alpha=0.95, zorder=5)
-    axp.set_xlabel("Gamma", fontsize=11, fontweight="bold")
-    axp.tick_params(labelleft=False)  # y labels live on the candle panel
-    axp.legend(loc="upper right", fontsize=7, framealpha=0.9)
-
-    # --- horizontal levels across both panels + label on the far right ---
-    trans = blended_transform_factory(axp.transAxes, axp.transData)
+    # ---- spot + GEX level lines on top of the field ----
+    ax.axhline(spot, color="white", ls="--", lw=1.4, alpha=0.9, zorder=7)
+    trans = None
+    from matplotlib.transforms import blended_transform_factory
+    trans = blended_transform_factory(ax.transAxes, ax.transData)
     for lbl, price, color, ls in levels:
-        if price is None or not np.isfinite(price):
+        if price is None or not np.isfinite(price) or not (pg[0] <= price <= pg[-1]):
             continue
-        axc.axhline(price, color=color, ls=ls, lw=1.6, alpha=0.85, zorder=6)
-        axp.axhline(price, color=color, ls=ls, lw=1.0, alpha=0.30, zorder=3)
-        axp.text(1.02, price, f"{lbl} {price:,.0f}", transform=trans,
-                 va="center", ha="left", fontsize=8, color="white",
-                 fontweight="bold",
-                 bbox=dict(boxstyle="round,pad=0.22", fc=color, ec="white",
-                           lw=0.7, alpha=0.92), zorder=7, clip_on=False)
+        ax.axhline(price, color=color, ls=ls, lw=1.3, alpha=0.85, zorder=7)
+        ax.text(0.004, price, f"{lbl} {price:,.0f}", transform=trans, va="center",
+                ha="left", fontsize=8, color="white", fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.2", fc=color, ec="none", alpha=0.85),
+                zorder=8)
 
-    # --- shared y-limits: candle range ∪ strike range ∪ level prices ---
-    lvl = [p for _, p, _, _ in levels if p is not None and np.isfinite(p)]
-    ymin = min(float(np.nanmin(l)), float(S.min()), min(lvl) if lvl else float(S.min()))
-    ymax = max(float(np.nanmax(h)), float(S.max()), max(lvl) if lvl else float(S.max()))
-    pad = (ymax - ymin) * 0.04 or 1.0
-    axc.set_ylim(ymin - pad, ymax + pad)
-
-    xmax = float(max(np.nanmax(tot_s), np.nanmax(buy_s), np.nanmax(sell_s), 1.0))
-    xmin = float(min(0.0, np.nanmin(net_s)))
-    axp.set_xlim(xmin * 1.08 if xmin < 0 else -0.03 * xmax, xmax * 1.12)
-
-    # --- candle x-axis time ticks ---
-    step = max(1, len(x) // 12)
-    ticks = list(range(0, len(x), step))
-    axc.set_xticks(ticks)
-    axc.set_xticklabels([idx[t].strftime("%d-%b %H:%M") for t in ticks],
-                        rotation=45, ha="right", fontsize=8)
-    axc.set_xlim(-1, len(x))
-    axc.set_xlabel("Time", fontsize=12, fontweight="bold")
-    axc.set_ylabel("Price", fontsize=12, fontweight="bold")
-    axc.grid(True, axis="y", alpha=0.30, ls="--", lw=0.5, color="#cccccc")
-    axc.set_title(title, fontsize=12, fontweight="bold", loc="left")
-    for a in (axc, axp):
-        for sp in a.spines.values():
-            sp.set_edgecolor("#aaaaaa")
-
-    fig.subplots_adjust(left=0.05, right=0.88, top=0.93, bottom=0.12)
+    ax.set_ylim(pg[0], pg[-1])
+    ax.set_xlim(x0, x1)
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b %H:%M"))
+    for lab in ax.get_xticklabels():
+        lab.set_rotation(45); lab.set_ha("right"); lab.set_color("white"); lab.set_fontsize(8)
+    ax.tick_params(colors="white")
+    ax.set_ylabel("Price", color="white", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Session time", color="white", fontsize=12, fontweight="bold")
+    ax.set_title(title, color="white", fontsize=12, fontweight="bold", loc="left")
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#444444")
+    fig.tight_layout()
     return fig
 
 @st.cache_data(show_spinner=False)
@@ -1314,7 +1322,7 @@ ist_str = (datetime.now(pytz.utc).astimezone(pytz.timezone("Asia/Kolkata"))
 
 view = st.radio(
     "View",
-    ["Gamma density (strike axis)", "Price candles + gamma profile"],
+    ["Gamma density (strike axis)", "VS3D net-GEX gradient (candles)"],
     horizontal=True,
 )
 
@@ -1327,35 +1335,38 @@ if view == "Gamma density (strike axis)":
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 else:
-    # Same levels as the strike view, as horizontal price lines; curves kept.
     levels = [
         ("Spot",        spot,                                         "#c400c4", "--"),
         ("Vol Trigger", vol_trigger,                                  "#0066cc", "-"),
-        ("Call Wall",   gravity["call_wall"],                         "#e03000", "--"),
-        ("Put Wall",    gravity["put_wall"],                          "#1a6bbf", "--"),
-        ("Pin",         pin["pin_strike"],                            "#FF6600", "-"),
-        ("Ceiling",     fc["ceiling"],                                "#D35400", "--"),
-        ("Floor",       fc["floor"],                                  "#148F77", "--"),
-        ("Upside HW",   hw["hedge_wall"] if hw else None,             "#8B008B", "--"),
-        ("Downside HW", dhw["downside_hedge_wall"] if dhw else None,  "#006400", "--"),
-        ("+1σ",         res["sig_up"],                                "#3a7d00", ":"),
-        ("-1σ",         res["sig_dn"],                                "#b8860b", ":"),
-        ("K*",          res["K_star"],                                "#0077bb", ":"),
+        ("Call Wall",   gravity["call_wall"],                         "#ff5544", "--"),
+        ("Put Wall",    gravity["put_wall"],                          "#4488ff", "--"),
+        ("Pin",         pin["pin_strike"],                            "#ffaa33", "-"),
+        ("Ceiling",     fc["ceiling"],                                "#ff8844", "--"),
+        ("Floor",       fc["floor"],                                  "#33cc99", "--"),
+        ("Upside HW",   hw["hedge_wall"] if hw else None,             "#cc66ff", "--"),
+        ("Downside HW", dhw["downside_hedge_wall"] if dhw else None,  "#66dd66", "--"),
+        ("K*",          res["K_star"],                                "#66ccff", ":"),
     ]
+    cc1, cc2 = st.columns(2)
+    smooth = cc1.slider("Profile smoothing (low = per-strike detail)",
+                        0.005, 0.10, 0.02, step=0.005)
+    gain = cc2.slider("Cone glow (gain)", 2.0, 8.0, 4.5, step=0.5)
     try:
         with st.spinner(f"Fetching {candle_bars} × {candle_interval} candles…"):
             candles = fetch_candles(tv_symbol, tv_exchange, tv,
                                     candle_interval, candle_bars, token)
-        title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  + gamma profile  "
+        title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX gradient  "
                  f"| expiry {expiry}  |  {ist_str}")
-        figp = build_price_profile_figure(candles, gex_df, levels, title)
+        figp = build_vs3d_gradient_figure(candles, gex_df, levels, spot, title,
+                                          smooth=smooth, gain=gain, mirror=True)
         st.pyplot(figp, use_container_width=True)
         plt.close(figp)
-        st.caption("Left: spot candles. Right: the strike-view gamma curves rotated "
-                   "into a profile sharing the price axis. Horizontal lines are the "
-                   "GEX levels for the selected expiry.")
+        st.caption("Net-GEX cone field (green = +ve gamma / red = −ve, black seam = "
+                   "flip) behind spot candles, per the vs3d gradient technique. Cone "
+                   "tails reach in from the right edge. Not participant-signed — green/"
+                   "red is the calls-plus / puts-minus convention.")
     except Exception as e:
-        st.error(f"Could not build price view: {e}")
+        st.error(f"Could not build gradient view: {e}")
 
 # ── Details / table ──────────────────────────────────────────────────────────
 with st.expander("Gravity centres · Pin · Floor/Ceiling · Hedge walls (detail)"):
