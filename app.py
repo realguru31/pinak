@@ -137,6 +137,7 @@ def compute_gex_density(calls_df, puts_df, spot_price, time_to_expiry,
         if not cd.empty:
             r = cd.iloc[0]
             iv = r["impliedVolatility"]
+            iv = iv / 100.0 if iv > 3 else iv     # NSE IV is in % (e.g. 12.3 -> 0.123)
             OI = r["openInterest"]
             coi = OI
             cp = r["lastPrice"]
@@ -152,6 +153,7 @@ def compute_gex_density(calls_df, puts_df, spot_price, time_to_expiry,
         if not pd_.empty:
             r = pd_.iloc[0]
             iv = r["impliedVolatility"]
+            iv = iv / 100.0 if iv > 3 else iv     # NSE IV is in % (e.g. 12.3 -> 0.123)
             OI = r["openInterest"]
             poi = OI
             pp = r["lastPrice"]
