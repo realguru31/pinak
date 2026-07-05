@@ -63,6 +63,10 @@ FIELD_MAPPINGS = {
     "totalTradedVolume":    "totalTradedVolume",
 }
 
+# Primary chain source: option-chain-v3 (per-expiry). Expiry must be appended as
+# &expiry=DD-FullMonth-YYYY  e.g.  07-July-2026
+NSE_OC_V3 = "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY"
+# Used only to discover the list of expiries for the dropdown.
 NSE_OC_INDICES = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
 RISK_FREE_RATE_DEFAULT = 0.05
 MIN_T = 1 / (24 * 60)  # one-minute floor on time-to-expiry (in years)
@@ -539,18 +543,51 @@ def _nse_session():
     return s
 
 
+def _to_v3_expiry(exp):
+    """Convert an NSE expiry string ('07-Jul-2026') to v3 URL format ('07-July-2026')."""
+    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(exp, fmt).strftime("%d-%B-%Y")
+        except (ValueError, TypeError):
+            continue
+    return exp
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_expiry_list(token):
+    """
+    Discover the list of NIFTY expiries for the dropdown. Tries v3 (no expiry)
+    first, then the indices endpoint — both return `records.expiryDates`.
+    """
+    last_err = None
+    for url in (NSE_OC_V3, NSE_OC_INDICES):
+        for _ in range(2):
+            try:
+                s = _nse_session()
+                r = s.get(url, timeout=15)
+                r.raise_for_status()
+                data = r.json()
+                exps = data.get("records", {}).get("expiryDates", [])
+                if exps:
+                    return exps
+            except Exception as e:
+                last_err = e
+                time.sleep(1.0)
+    raise RuntimeError(f"NSE expiry-list fetch failed: {last_err}")
+
+
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_option_chain_raw(token):
+def fetch_option_chain_v3(expiry, token):
     """
-    Full NIFTY option chain from NSE (same source as the reference script).
-    Uses the indices endpoint so we get `records.expiryDates` for the dropdown
-    and every expiry's rows in one shot (we filter client-side by expiry).
+    NIFTY option chain for a single expiry from the NSE v3 endpoint:
+      api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=07-July-2026
     """
+    url = f"{NSE_OC_V3}&expiry={_to_v3_expiry(expiry)}"
     last_err = None
     for _ in range(3):
         try:
             s = _nse_session()
-            r = s.get(NSE_OC_INDICES, timeout=15)
+            r = s.get(url, timeout=15)
             r.raise_for_status()
             data = r.json()
             if data and "records" in data:
@@ -558,7 +595,7 @@ def fetch_option_chain_raw(token):
         except Exception as e:
             last_err = e
             time.sleep(1.0)
-    raise RuntimeError(f"NSE option chain fetch failed: {last_err}")
+    raise RuntimeError(f"NSE v3 option-chain fetch failed: {last_err}")
 
 
 def parse_options(json_data, field_mappings, expiry_filter=None):
@@ -866,7 +903,8 @@ def build_gamma_figure(gex_df, spot, K_star, F_at_Kstar, ticker, exp_str,
 @st.cache_data(show_spinner=False)
 def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
                  strike_hi, token):
-    calls_list, puts_list = parse_options(_raw_json, FIELD_MAPPINGS, expiry_filter=expiry)
+    # v3 response is already scoped to the requested expiry — no client-side filter
+    calls_list, puts_list = parse_options(_raw_json, FIELD_MAPPINGS, expiry_filter=None)
     calls = _clean_df(calls_list)
     puts = _clean_df(puts_list)
     if calls.empty or puts.empty:
@@ -972,19 +1010,18 @@ try:
 except Exception:
     fallback_iv, rv = 0.20, 0.20
 
-try:
-    with st.spinner("Fetching NIFTY option chain from NSE…"):
-        raw = fetch_option_chain_raw(token)
-except Exception as e:
-    col_err.error(
-        f"NSE option-chain fetch failed: {e}\n\n"
-        "NSE frequently blocks cloud/datacenter IPs (Streamlit Cloud, AWS, GCP). "
-        "If you see this on a hosted deploy, run the app locally or route NSE "
-        "traffic through a residential/India proxy."
-    )
-    st.stop()
+_nse_note = (
+    "\n\nNSE frequently blocks cloud/datacenter IPs (Streamlit Cloud, AWS, GCP). "
+    "If you see this on a hosted deploy, run the app locally or route NSE "
+    "traffic through a residential/India proxy."
+)
 
-expiry_dates = raw.get("records", {}).get("expiryDates", [])
+try:
+    with st.spinner("Fetching NIFTY expiries from NSE…"):
+        expiry_dates = fetch_expiry_list(token)
+except Exception as e:
+    col_err.error(f"NSE expiry-list fetch failed: {e}{_nse_note}")
+    st.stop()
 if not expiry_dates:
     st.error("NSE returned no expiry dates.")
     st.stop()
@@ -1004,6 +1041,14 @@ with top[1]:
 with top[2]:
     st.metric("Spot (NSE:NIFTY)", f"{spot:,.2f}",
               help=f"tvdatafeed bar time: {spot_ts}")
+
+# ── Fetch the selected expiry's chain from the v3 endpoint ───────────────────
+try:
+    with st.spinner(f"Fetching option chain (v3) for {expiry}…"):
+        raw = fetch_option_chain_v3(expiry, token)
+except Exception as e:
+    col_err.error(f"NSE v3 option-chain fetch failed: {e}{_nse_note}")
+    st.stop()
 
 # ── Run analytics ────────────────────────────────────────────────────────────
 try:
