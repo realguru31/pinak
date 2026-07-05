@@ -24,7 +24,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless backend for servers / Streamlit Cloud
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import log, sqrt, exp
 
 import numpy as np
@@ -49,7 +49,7 @@ NSE_HEADERS = {
     "Accept-Encoding":  "gzip, deflate, br",
     "Connection":       "keep-alive",
     "Accept":           "application/json",
-    "Referer":          "https://www.nseindia.com/option-chain-v3",
+    "Referer":          "https://www.nseindia.com/option-chain",
     "Host":             "www.nseindia.com",
     "X-Requested-With": "XMLHttpRequest",
 }
@@ -63,11 +63,11 @@ FIELD_MAPPINGS = {
     "totalTradedVolume":    "totalTradedVolume",
 }
 
-# Primary chain source: option-chain-v3 (per-expiry). Expiry must be appended as
-# &expiry=DD-FullMonth-YYYY  e.g.  07-July-2026
+# Sole chain source: option-chain-v3. A call WITH a valid expiry returns both the
+# chain for that expiry AND records.expiryDates (the full list of all expiries),
+# so v3 is used for everything. Expiry is appended as &expiry=DD-FullMonth-YYYY
+# e.g.  07-July-2026
 NSE_OC_V3 = "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY"
-# Used only to discover the list of expiries for the dropdown.
-NSE_OC_INDICES = "https://www.nseindia.com/api/option-chain-indices-v3?symbol=NIFTY"
 RISK_FREE_RATE_DEFAULT = 0.05
 MIN_T = 1 / (24 * 60)  # one-minute floor on time-to-expiry (in years)
 
@@ -539,7 +539,7 @@ def _nse_session():
     s = requests.Session()
     s.headers.update(NSE_HEADERS)
     s.get("https://www.nseindia.com", timeout=10)
-    s.get("https://www.nseindia.com/option-chain-v3", timeout=10)
+    s.get("https://www.nseindia.com/option-chain", timeout=10)
     return s
 
 
@@ -553,27 +553,67 @@ def _to_v3_expiry(exp):
     return exp
 
 
+def _expiry_candidates(days_ahead=50):
+    """Upcoming Tuesdays & Thursdays — backup seeds covering current & legacy NIFTY expiry regimes."""
+    today = datetime.now().date()
+    return [today + timedelta(days=i) for i in range(days_ahead)
+            if (today + timedelta(days=i)).weekday() in (1, 3)]
+
+
+def _expiries_from_json(data):
+    return (data or {}).get("records", {}).get("expiryDates", []) or []
+
+
+def _seed_expiry_from_v3(session):
+    """
+    v3 with no expiry returns a default chain but NO expiryDates list. Grab any
+    expiry string from its rows to use as a seed for the real (full-list) call.
+    """
+    try:
+        r = session.get(NSE_OC_V3, timeout=15)
+        if r.status_code != 200:
+            return None
+        for rec in r.json().get("records", {}).get("data", []):
+            for leg in ("CE", "PE"):
+                e = rec.get(leg, {}).get("expiryDate")
+                if e:
+                    return e
+    except Exception:
+        pass
+    return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_expiry_list(token):
     """
-    Discover the list of NIFTY expiries for the dropdown. Tries v3 (no expiry)
-    first, then the indices endpoint — both return `records.expiryDates`.
+    Get the full NIFTY expiry list from the v3 endpoint (the only NSE endpoint
+    that still works for this and that carries `records.expiryDates`).
+
+    A v3 call *with* a valid expiry returns the complete expiryDates list, so we
+    only need one good expiry to seed it: first from v3's default chain, then
+    from upcoming Tue/Thu dates as backup.
     """
     last_err = None
-    for url in (NSE_OC_V3, NSE_OC_INDICES):
-        for _ in range(2):
-            try:
-                s = _nse_session()
-                r = s.get(url, timeout=15)
-                r.raise_for_status()
-                data = r.json()
-                exps = data.get("records", {}).get("expiryDates", [])
-                if exps:
-                    return exps
-            except Exception as e:
-                last_err = e
-                time.sleep(1.0)
-    raise RuntimeError(f"NSE expiry-list fetch failed: {last_err}")
+    sess = _nse_session()
+
+    seeds = []
+    seed = _seed_expiry_from_v3(sess)
+    if seed:
+        seeds.append(seed)
+    seeds += [d.strftime("%d-%b-%Y") for d in _expiry_candidates()]
+
+    for seed in seeds:
+        try:
+            r = sess.get(f"{NSE_OC_V3}&expiry={_to_v3_expiry(seed)}", timeout=15)
+            if r.status_code != 200:
+                continue
+            exps = _expiries_from_json(r.json())
+            if exps:
+                return exps
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"Could not resolve NIFTY expiries from NSE v3. Last error: {last_err}")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
