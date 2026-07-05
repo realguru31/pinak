@@ -1013,15 +1013,17 @@ def build_gamma_figure(gex_df, spot, K_star, F_at_Kstar, ticker, exp_str,
 
 from matplotlib.colors import LinearSegmentedColormap
 
-# exact vs3d GEX colormap (red -> black seam -> green)
+# GEX colormap — near-zero is DARK-COLORED (not black); only a thin seam stays
+# near-black. Strong +GEX -> bright green, strong -GEX -> bright red. This kills
+# the dead black space while keeping the flip readable as a thin seam.
 _GEX_CMAP = LinearSegmentedColormap.from_list("vs3d_gex", [
-    (0.00, (0.50, 0.00, 0.00)),
-    (0.34, (0.86, 0.06, 0.06)),
-    (0.47, (0.10, 0.00, 0.00)),
-    (0.50, (0.00, 0.00, 0.00)),
-    (0.53, (0.00, 0.10, 0.00)),
-    (0.66, (0.10, 0.74, 0.18)),
-    (1.00, (0.02, 0.42, 0.06)),
+    (0.00, (0.95, 0.15, 0.12)),   # strong -GEX  -> bright red
+    (0.30, (0.55, 0.05, 0.04)),   # mid red
+    (0.46, (0.18, 0.02, 0.02)),   # faint -GEX   -> dark red (NOT black)
+    (0.50, (0.02, 0.02, 0.02)),   # thin seam    -> near-black flip line
+    (0.54, (0.02, 0.16, 0.04)),   # faint +GEX   -> dark green (NOT black)
+    (0.70, (0.06, 0.50, 0.14)),   # mid green
+    (1.00, (0.15, 0.95, 0.30)),   # strong +GEX  -> bright green
 ])
 
 
@@ -1064,16 +1066,20 @@ def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
 
     if cone_mode:
         # vs3d field_from_profile: each price row "reaches" across x in proportion
-        # to |net GEX| -> tapering cone. Preserve sign (green +/red -).
+        # to |net GEX| -> tapering cone. A baseline tint floor keeps every row
+        # colored on its sign side (green above flip / red below) so there is no
+        # dead black space — the cone just brightens into the walls.
         n_x = 360
         mag = np.abs(col)                            # 0..1 reach per price row
         xs = np.linspace(0.0, 1.0, n_x)
-        reach = np.tanh(cone_gain * (mag[:, None] - xs[None, :]))   # -1..1 glow
-        reach = np.clip(reach, 0.0, 1.0)             # 0..1 intensity mask
-        field = reach * np.sign(col)[:, None]        # apply sign -> -1..1
-        field = field[:, ::-1]                       # tails reach in from the RIGHT
+        reach = np.clip(np.tanh(cone_gain * (mag[:, None] - xs[None, :])), 0.0, 1.0)
+        base = 0.20                                  # regime tint floor
+        intensity = base + (1.0 - base) * reach      # base..1
+        field = np.sign(col)[:, None] * intensity    # ±(base..1); sign=0 at seam
+        field = field[:, ::-1]                        # tails reach in from the RIGHT
     else:
-        field = np.tile(col[:, None], (1, 8))        # flat color-bands across time
+        # flat color-bands; near-zero now maps to dark colour (not black) via cmap
+        field = np.tile(col[:, None], (1, 8))
 
     # ---- time extent from the candles ----
     idx = candles.index
