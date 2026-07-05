@@ -485,7 +485,20 @@ def find_optimal_strike_K_star(gex_df):
                      "forward_price": fwd, "fx": fx,
                      "f_min": fmn, "f_max": fmx, "contradiction": con})
     df = pd.DataFrame(rows)
-    valid = df[~df["contradiction"]]
+
+    # Eligibility mask: a K* candidate must have REAL option prices AND non-trivial
+    # gamma. Without this, empty deep-OTM strikes (call_gex≈put_gex≈0) win with a
+    # fake-zero fx and drag K* to the edge (e.g. 22,350). K* should sit near the
+    # flip where call/put GEX actually balance.
+    gtot = df["call_gex"] + df["put_gex"]
+    gmax = gtot.max()
+    eligible = df[
+        (df["call_gex"] > 0) & (df["put_gex"] > 0) &  # both sides have gamma
+        (gtot >= 0.05 * gmax if gmax > 0 else False)  # non-trivial magnitude
+    ]
+    valid = eligible[~eligible["contradiction"]]
+    if valid.empty:
+        valid = eligible if not eligible.empty else df[~df["contradiction"]]
     if valid.empty:
         valid = df
     best = valid.loc[valid["fx"].idxmin()]
