@@ -49,7 +49,7 @@ NSE_HEADERS = {
     "Accept-Encoding":  "gzip, deflate, br",
     "Connection":       "keep-alive",
     "Accept":           "application/json",
-    "Referer":          "https://www.nseindia.com/option-chain",
+    "Referer":          "https://www.nseindia.com/option-chain-v3",
     "Host":             "www.nseindia.com",
     "X-Requested-With": "XMLHttpRequest",
 }
@@ -67,7 +67,7 @@ FIELD_MAPPINGS = {
 # &expiry=DD-FullMonth-YYYY  e.g.  07-July-2026
 NSE_OC_V3 = "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY"
 # Used only to discover the list of expiries for the dropdown.
-NSE_OC_INDICES = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+NSE_OC_INDICES = "https://www.nseindia.com/api/option-chain-indices-v3?symbol=NIFTY"
 RISK_FREE_RATE_DEFAULT = 0.05
 MIN_T = 1 / (24 * 60)  # one-minute floor on time-to-expiry (in years)
 
@@ -539,7 +539,7 @@ def _nse_session():
     s = requests.Session()
     s.headers.update(NSE_HEADERS)
     s.get("https://www.nseindia.com", timeout=10)
-    s.get("https://www.nseindia.com/option-chain", timeout=10)
+    s.get("https://www.nseindia.com/option-chain-v3", timeout=10)
     return s
 
 
