@@ -984,15 +984,36 @@ def build_gamma_figure(gex_df, spot, K_star, F_at_Kstar, ticker, exp_str,
 
 
 # =============================================================================
-# PRICE VIEW  (spot candlesticks over time + horizontal GEX levels)
+# PRICE VIEW  (spot candles + rotated gamma-curve profile sharing the price axis)
 # =============================================================================
 
-def build_price_levels_figure(candles, levels, title):
+def build_price_profile_figure(candles, gex_df, levels, title):
     """
-    Second view: NIFTY spot as candlesticks (x = time, y = price) with the GEX
-    levels drawn as horizontal price lines. The strike-view's vertical lines are
-    horizontal here — the same levels, flipped onto a price chart.
+    Second view. Left panel: NIFTY spot candlesticks (x = time, y = price).
+    Right panel: the SAME gamma curves from the strike view, rotated 90° into a
+    profile (x = gamma, y = strike) sharing the price axis — so each gamma level
+    lines up horizontally with the candle price it sits at. The curves are kept,
+    not removed.
     """
+    from matplotlib.transforms import blended_transform_factory
+
+    # --- smoothed gamma curves (same construction as the strike view) ---
+    S = gex_df["strike"].to_numpy(dtype=float)
+    if len(S) > 3:
+        sg = 2.0
+        sell_s = gaussian_filter1d(np.abs(gex_df["sell_gamma"].values), sigma=sg)
+        buy_s  = gaussian_filter1d(np.abs(gex_df["buy_gamma"].values), sigma=sg)
+        net_s  = gaussian_filter1d(gex_df["net_gex"].values, sigma=sg)
+        tot_s  = gaussian_filter1d(gex_df["total_gamma"].values, sigma=sg)
+    else:
+        sell_s = np.abs(gex_df["sell_gamma"].values)
+        buy_s  = np.abs(gex_df["buy_gamma"].values)
+        net_s  = gex_df["net_gex"].values
+        tot_s  = gex_df["total_gamma"].values
+
+    C_SELL, C_BUY, C_NET, C_TOTAL = "#cc0000", "#007700", "#b8860b", "#cc6600"
+    UP, DN = "#137333", "#c5221f"
+
     o = candles["open"].to_numpy(dtype=float)
     h = candles["high"].to_numpy(dtype=float)
     l = candles["low"].to_numpy(dtype=float)
@@ -1000,54 +1021,83 @@ def build_price_levels_figure(candles, levels, title):
     x = np.arange(len(candles))
     idx = candles.index
 
-    fig, ax = plt.subplots(figsize=(20, 11))
+    fig = plt.figure(figsize=(22, 11))
     fig.patch.set_facecolor("white")
-    ax.set_facecolor("white")
+    gs = fig.add_gridspec(1, 2, width_ratios=[3.2, 1.0], wspace=0.03)
+    axc = fig.add_subplot(gs[0, 0])
+    axp = fig.add_subplot(gs[0, 1], sharey=axc)
+    for a in (axc, axp):
+        a.set_facecolor("white")
 
-    UP, DN = "#137333", "#c5221f"
-    body_w = 0.62
+    # --- candles ---
     rng = float(np.nanmax(h) - np.nanmin(l)) or 1.0
-    min_body = rng * 0.0008  # so dojis remain visible
-
+    min_body = rng * 0.0008
+    body_w = 0.62
     for i in range(len(x)):
         col = UP if c[i] >= o[i] else DN
-        ax.plot([x[i], x[i]], [l[i], h[i]], color=col, lw=0.9, zorder=3)  # wick
+        axc.plot([x[i], x[i]], [l[i], h[i]], color=col, lw=0.9, zorder=3)
         lo, hi = (o[i], c[i]) if c[i] >= o[i] else (c[i], o[i])
-        ax.add_patch(plt.Rectangle((x[i] - body_w / 2, lo), body_w,
-                                   max(hi - lo, min_body),
-                                   facecolor=col, edgecolor=col, zorder=4))
+        axc.add_patch(plt.Rectangle((x[i] - body_w / 2, lo), body_w,
+                                    max(hi - lo, min_body),
+                                    facecolor=col, edgecolor=col, zorder=4))
 
-    right = len(x) - 0.5
+    # --- gamma profile (curves rotated: gamma on x, strike on y) ---
+    axp.axvline(0, color="#555555", lw=1.0, alpha=0.6, zorder=2)
+    axp.fill_betweenx(S, 0, net_s, where=(net_s > 0), facecolor="#22aa22",
+                      alpha=0.15, interpolate=True, zorder=2)
+    axp.fill_betweenx(S, 0, net_s, where=(net_s < 0), facecolor="#ff4444",
+                      alpha=0.15, interpolate=True, zorder=2)
+    axp.plot(tot_s,  S, color=C_TOTAL, lw=2.0, label="Total Gamma", alpha=0.9, zorder=4)
+    axp.plot(buy_s,  S, color=C_BUY,   lw=1.8, label="Buy Gamma",  alpha=0.9, zorder=4)
+    axp.plot(sell_s, S, color=C_SELL,  lw=1.8, label="Sell Gamma", alpha=0.9, zorder=4)
+    axp.plot(net_s,  S, color=C_NET,   lw=2.6, label="Net Gamma",  alpha=0.95, zorder=5)
+    axp.set_xlabel("Gamma", fontsize=11, fontweight="bold")
+    axp.tick_params(labelleft=False)  # y labels live on the candle panel
+    axp.legend(loc="upper right", fontsize=7, framealpha=0.9)
+
+    # --- horizontal levels across both panels + label on the far right ---
+    trans = blended_transform_factory(axp.transAxes, axp.transData)
     for lbl, price, color, ls in levels:
         if price is None or not np.isfinite(price):
             continue
-        ax.axhline(price, color=color, ls=ls, lw=1.8, alpha=0.9, zorder=5)
-        ax.text(right, price, f"  {lbl} {price:,.0f}", va="center", ha="left",
-                fontsize=8, color="white", fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.25", fc=color, ec="white",
-                          lw=0.8, alpha=0.92), zorder=6)
+        axc.axhline(price, color=color, ls=ls, lw=1.6, alpha=0.85, zorder=6)
+        axp.axhline(price, color=color, ls=ls, lw=1.0, alpha=0.30, zorder=3)
+        axp.text(1.02, price, f"{lbl} {price:,.0f}", transform=trans,
+                 va="center", ha="left", fontsize=8, color="white",
+                 fontweight="bold",
+                 bbox=dict(boxstyle="round,pad=0.22", fc=color, ec="white",
+                           lw=0.7, alpha=0.92), zorder=7, clip_on=False)
 
+    # --- shared y-limits: candle range ∪ strike range ∪ level prices ---
+    lvl = [p for _, p, _, _ in levels if p is not None and np.isfinite(p)]
+    ymin = min(float(np.nanmin(l)), float(S.min()), min(lvl) if lvl else float(S.min()))
+    ymax = max(float(np.nanmax(h)), float(S.max()), max(lvl) if lvl else float(S.max()))
+    pad = (ymax - ymin) * 0.04 or 1.0
+    axc.set_ylim(ymin - pad, ymax + pad)
+
+    xmax = float(max(np.nanmax(tot_s), np.nanmax(buy_s), np.nanmax(sell_s), 1.0))
+    xmin = float(min(0.0, np.nanmin(net_s)))
+    axp.set_xlim(xmin * 1.08 if xmin < 0 else -0.03 * xmax, xmax * 1.12)
+
+    # --- candle x-axis time ticks ---
     step = max(1, len(x) // 12)
     ticks = list(range(0, len(x), step))
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([idx[t].strftime("%d-%b %H:%M") for t in ticks],
-                       rotation=45, ha="right", fontsize=8)
-    ax.set_xlim(-1, len(x) + max(6, len(x) * 0.14))  # room for right-side labels
+    axc.set_xticks(ticks)
+    axc.set_xticklabels([idx[t].strftime("%d-%b %H:%M") for t in ticks],
+                        rotation=45, ha="right", fontsize=8)
+    axc.set_xlim(-1, len(x))
+    axc.set_xlabel("Time", fontsize=12, fontweight="bold")
+    axc.set_ylabel("Price", fontsize=12, fontweight="bold")
+    axc.grid(True, axis="y", alpha=0.30, ls="--", lw=0.5, color="#cccccc")
+    axc.set_title(title, fontsize=12, fontweight="bold", loc="left")
+    for a in (axc, axp):
+        for sp in a.spines.values():
+            sp.set_edgecolor("#aaaaaa")
 
-    lvl_prices = [p for _, p, _, _ in levels if p is not None and np.isfinite(p)]
-    ymin = min(float(np.nanmin(l)), min(lvl_prices) if lvl_prices else float(np.nanmin(l)))
-    ymax = max(float(np.nanmax(h)), max(lvl_prices) if lvl_prices else float(np.nanmax(h)))
-    pad = (ymax - ymin) * 0.05 or 1.0
-    ax.set_ylim(ymin - pad, ymax + pad)
-
-    ax.set_xlabel("Time", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Price", fontsize=12, fontweight="bold")
-    ax.set_title(title, fontsize=13, fontweight="bold")
-    ax.grid(True, axis="y", alpha=0.30, ls="--", lw=0.5, color="#cccccc")
-    for sp in ax.spines.values():
-        sp.set_edgecolor("#aaaaaa")
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.05, right=0.88, top=0.93, bottom=0.12)
     return fig
+
+@st.cache_data(show_spinner=False)
 def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
                  strike_hi, token):
     # v3 response is already scoped to the requested expiry — no client-side filter
@@ -1264,7 +1314,7 @@ ist_str = (datetime.now(pytz.utc).astimezone(pytz.timezone("Asia/Kolkata"))
 
 view = st.radio(
     "View",
-    ["Gamma density (strike axis)", "Price + GEX levels (candles)"],
+    ["Gamma density (strike axis)", "Price candles + gamma profile"],
     horizontal=True,
 )
 
@@ -1277,32 +1327,33 @@ if view == "Gamma density (strike axis)":
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 else:
-    # Same levels as the strike view, drawn as horizontal price lines.
+    # Same levels as the strike view, as horizontal price lines; curves kept.
     levels = [
-        ("Spot",        spot,                                 "#c400c4", "--"),
-        ("Vol Trigger", vol_trigger,                          "#0066cc", "-"),
-        ("Call Wall",   gravity["call_wall"],                 "#e03000", "--"),
-        ("Put Wall",    gravity["put_wall"],                  "#1a6bbf", "--"),
-        ("Pin",         pin["pin_strike"],                    "#FF6600", "-"),
-        ("Ceiling",     fc["ceiling"],                        "#D35400", "--"),
-        ("Floor",       fc["floor"],                          "#148F77", "--"),
-        ("Upside HW",   hw["hedge_wall"] if hw else None,     "#8B008B", "--"),
-        ("Downside HW", dhw["downside_hedge_wall"] if dhw else None, "#006400", "--"),
-        ("+1σ",         res["sig_up"],                        "#3a7d00", ":"),
-        ("-1σ",         res["sig_dn"],                        "#b8860b", ":"),
-        ("K*",          res["K_star"],                        "#0077bb", ":"),
+        ("Spot",        spot,                                         "#c400c4", "--"),
+        ("Vol Trigger", vol_trigger,                                  "#0066cc", "-"),
+        ("Call Wall",   gravity["call_wall"],                         "#e03000", "--"),
+        ("Put Wall",    gravity["put_wall"],                          "#1a6bbf", "--"),
+        ("Pin",         pin["pin_strike"],                            "#FF6600", "-"),
+        ("Ceiling",     fc["ceiling"],                                "#D35400", "--"),
+        ("Floor",       fc["floor"],                                  "#148F77", "--"),
+        ("Upside HW",   hw["hedge_wall"] if hw else None,             "#8B008B", "--"),
+        ("Downside HW", dhw["downside_hedge_wall"] if dhw else None,  "#006400", "--"),
+        ("+1σ",         res["sig_up"],                                "#3a7d00", ":"),
+        ("-1σ",         res["sig_dn"],                                "#b8860b", ":"),
+        ("K*",          res["K_star"],                                "#0077bb", ":"),
     ]
     try:
         with st.spinner(f"Fetching {candle_bars} × {candle_interval} candles…"):
             candles = fetch_candles(tv_symbol, tv_exchange, tv,
                                     candle_interval, candle_bars, token)
-        title = (f"{tv_exchange}:{tv_symbol}  spot candles ({candle_interval})  "
-                 f"+ GEX levels for expiry {expiry}  |  {ist_str}")
-        figp = build_price_levels_figure(candles, levels, title)
+        title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  + gamma profile  "
+                 f"| expiry {expiry}  |  {ist_str}")
+        figp = build_price_profile_figure(candles, gex_df, levels, title)
         st.pyplot(figp, use_container_width=True)
         plt.close(figp)
-        st.caption("GEX levels (horizontal) are computed from the option chain for "
-                   "the selected expiry; candles are live spot from tvdatafeed.")
+        st.caption("Left: spot candles. Right: the strike-view gamma curves rotated "
+                   "into a profile sharing the price axis. Horizontal lines are the "
+                   "GEX levels for the selected expiry.")
     except Exception as e:
         st.error(f"Could not build price view: {e}")
 
