@@ -1,0 +1,10 @@
+streamlit>=1.31
+tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+matplotlib>=3.7
+requests>=2.31
+pytz>=2023.3
+# optional: enables the "Auto-refresh" checkbox in the sidebar
+streamlit-autorefresh>=1.0.1
