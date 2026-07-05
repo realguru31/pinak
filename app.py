@@ -1010,103 +1010,90 @@ _GEX_CMAP = LinearSegmentedColormap.from_list("vs3d_gex", [
 ])
 
 
-def _bs_gamma_grid(P, K, iv, T, r):
-    """Vectorized BS gamma over price grid P (n_price,) for strike arrays K, iv (n_legs,)."""
-    P = P[:, None]
-    K = K[None, :]
-    iv = iv[None, :]
-    sqrtT = np.sqrt(T)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        d1 = (np.log(P / K) + (r + 0.5 * iv ** 2) * T) / (iv * sqrtT)
-        g = np.exp(-0.5 * d1 ** 2) / np.sqrt(2 * np.pi) / (P * iv * sqrtT)
-    return np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def build_forward_gradient_figure(candles, sim_legs, spot, expiry_dt, r, levels,
-                                  title, band_pct=2.5, n_price=160, n_time=90,
-                                  pct=92.0):
+def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
+                                  title, band_pct=4.0, n_price=400, smooth=0.6):
     """
-    Forward-simulation net-GEX gradient behind spot candles. x runs from the
-    first candle time to the expiry; each column recomputes net GEX at its own
-    time-to-expiry, so the field decays/sharpens toward expiry.
+    Horizontal color-map of the **Net GEX** profile (image-2's Neutral-Gamma
+    curve, rotated 90°): y = price, color = net GEX at that price level.
+      green  = +ve net GEX  (dealers long gamma, dampening)
+      red    = -ve net GEX  (dealers short gamma, amplifying)
+      black  = the zero seam == the vol trigger / gamma flip
+    Per-strike detail (the bumps: walls, pin) is PRESERVED — only light
+    interpolation smoothing. The same profile is painted across the full time
+    width so candles overlay on top. (Not the forward BS decay — structure,
+    not decay, is the point here.)
     """
     import matplotlib.dates as mdates
 
-    if not sim_legs:
-        raise RuntimeError("No option legs available for the forward simulation.")
-    K = np.array([s for s, _, _, _ in sim_legs], dtype=float)
-    IV = np.array([v for _, v, _, _ in sim_legs], dtype=float)
-    W = np.array([oi * sgn for _, _, oi, sgn in sim_legs], dtype=float)  # signed OI
+    # ---- Net GEX per strike -> price grid (minimal smoothing, keep the bumps) ----
+    ks = gex_df["strike"].to_numpy(dtype=float)
+    net = gex_df["net_gex"].to_numpy(dtype=float)
+    order = np.argsort(ks)
+    ks, net = ks[order], net[order]
 
-    # ---- price grid: spot ±band%, widened to include levels ----
     lo = spot * (1 - band_pct / 100.0)
     hi = spot * (1 + band_pct / 100.0)
     lvl = [p for _, p, _, _ in levels if p is not None and np.isfinite(p)]
     if lvl:
         lo = min(lo, min(lvl)); hi = max(hi, max(lvl))
+    # clamp to the strikes we actually have so we don't paint flat tails forever
+    lo = max(lo, ks.min()); hi = min(hi, ks.max())
     pg = np.linspace(lo, hi, n_price)
 
-    # ---- time axis: first candle -> expiry (matplotlib date numbers, in days) ----
+    prof = np.interp(pg, ks, net, left=0.0, right=0.0)
+    if smooth and smooth > 0:
+        prof = gaussian_filter1d(prof, max(0.3, n_price * (smooth / 100.0)))
+
+    # ---- normalize about ZERO so the seam is exactly at net GEX = 0 (the flip) ----
+    scale = np.percentile(np.abs(prof), 98) or 1.0
+    col = np.clip(prof / scale, -1.0, 1.0)          # -1..1, 0 -> black seam
+    field = np.tile(col[:, None], (1, 8))            # constant across time width
+
+    # ---- time extent from the candles ----
     idx = candles.index
     xc = mdates.date2num(idx.to_pydatetime())
-    x0 = float(xc[0])
-    x1 = float(mdates.date2num(expiry_dt))
-    if x1 <= x0:                       # expiry already passed -> small forward window
-        x1 = float(xc[-1]) + 0.25
-    tcols = np.linspace(x0, x1, n_time)
-
-    # ---- forward field: recompute net GEX at each column's time-to-expiry ----
-    Z = np.zeros((n_price, n_time), dtype=float)
-    for j, tnum in enumerate(tcols):
-        T = max((x1 - tnum) / 365.0, MIN_T)          # years to expiry at this column
-        g = _bs_gamma_grid(pg, K, IV, T, r)          # (n_price, n_legs)
-        Z[:, j] = (g * (W * 100.0)[None, :]).sum(axis=1) * pg  # ·100·P, signed by OI
-
-    Z = gaussian_filter1d(Z, 1.2, axis=0)            # smooth along PRICE only
-    scale = np.percentile(np.abs(Z), pct) or 1.0     # percentile clip (not max)
-    Zn = np.clip(Z / scale, -1.0, 1.0)
+    x0, x1 = float(xc[0]), float(xc[-1])
+    if x1 <= x0:
+        x1 = x0 + 1.0
 
     fig, ax = plt.subplots(figsize=(20, 10))
     fig.patch.set_facecolor("black")
     ax.set_facecolor("black")
 
-    ax.imshow(Zn, origin="lower", extent=[x0, x1, pg[0], pg[-1]], aspect="auto",
+    ax.imshow(field, origin="lower", extent=[x0, x1, pg[0], pg[-1]], aspect="auto",
               cmap=_GEX_CMAP, vmin=-1, vmax=1, interpolation="bilinear", zorder=0)
 
-    # ---- candles (width from MEDIAN bar spacing so they don't overlap) ----
+    # ---- candles (width from median bar spacing -> no overlap) ----
     o = candles["open"].to_numpy(dtype=float)
     h = candles["high"].to_numpy(dtype=float)
     l = candles["low"].to_numpy(dtype=float)
     c = candles["close"].to_numpy(dtype=float)
-    if len(xc) > 1:
-        bw = float(np.median(np.diff(xc))) * 0.7
-    else:
-        bw = (x1 - x0) / 100.0
+    bw = float(np.median(np.diff(xc))) * 0.7 if len(xc) > 1 else (x1 - x0) / 100.0
     wick_min = float(np.nanmean(h - l)) * 0.02 if len(h) else 0.01
     for i in range(len(xc)):
         up = c[i] >= o[i]
-        body = "#e8e8e8" if up else "#141414"
-        edge = "#f5f5f5" if up else "#9a9a9a"
+        body = "#f0f0f0" if up else "#151515"
+        edge = "#ffffff" if up else "#9a9a9a"
         ax.plot([xc[i], xc[i]], [l[i], h[i]], color=edge, lw=0.7, zorder=5)
         lo_b, hi_b = (o[i], c[i]) if up else (c[i], o[i])
         ax.add_patch(plt.Rectangle((xc[i] - bw / 2, lo_b), bw,
                                    max(hi_b - lo_b, wick_min),
                                    facecolor=body, edgecolor=edge, lw=0.4, zorder=6))
 
-    # ---- expiry marker + spot + level lines ----
-    ax.axvline(x1, color="#3399dd", ls=":", lw=1.4, alpha=0.9, zorder=7)
+    # ---- spot + flip + level lines, de-collided labels ----
     from matplotlib.transforms import blended_transform_factory
     trans = blended_transform_factory(ax.transAxes, ax.transData)
     ax.axhline(spot, color="white", ls="--", lw=1.3, alpha=0.9, zorder=7)
-    # de-collide labels: skip a label if one was placed within 0.2% of this price
+    if vol_trigger is not None and pg[0] <= vol_trigger <= pg[-1]:
+        ax.axhline(vol_trigger, color="#33aaff", ls="-", lw=1.6, alpha=0.95, zorder=7)
+
     placed = []
     for lbl, price, color, ls in sorted(
-            [(lbl, p, col, s) for (lbl, p, col, s) in levels
+            [(a, p, cl, s) for (a, p, cl, s) in levels
              if p is not None and np.isfinite(p) and pg[0] <= p <= pg[-1]],
             key=lambda t: t[1]):
-        ax.axhline(price, color=color, ls=ls, lw=1.2, alpha=0.85, zorder=7)
-        show = all(abs(price - q) > 0.002 * spot for q in placed)
-        if show:
+        ax.axhline(price, color=color, ls=ls, lw=1.1, alpha=0.85, zorder=7)
+        if all(abs(price - q) > 0.0015 * spot for q in placed):
             ax.text(0.004, price, f"{lbl} {price:,.0f}", transform=trans, va="center",
                     ha="left", fontsize=8, color="white", fontweight="bold",
                     bbox=dict(boxstyle="round,pad=0.2", fc=color, ec="none", alpha=0.85),
@@ -1121,8 +1108,7 @@ def build_forward_gradient_figure(candles, sim_legs, spot, expiry_dt, r, levels,
         lab.set_rotation(45); lab.set_ha("right"); lab.set_color("white"); lab.set_fontsize(8)
     ax.tick_params(colors="white")
     ax.set_ylabel("Price", color="white", fontsize=12, fontweight="bold")
-    ax.set_xlabel("Time  (candles = history · field decays to expiry ⟶)",
-                  color="white", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Time", color="white", fontsize=12, fontweight="bold")
     ax.set_title(title, color="white", fontsize=12, fontweight="bold", loc="left")
     for sp in ax.spines.values():
         sp.set_edgecolor("#444444")
