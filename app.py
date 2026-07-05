@@ -1350,7 +1350,7 @@ ist_str = (datetime.now(pytz.utc).astimezone(pytz.timezone("Asia/Kolkata"))
 
 view = st.radio(
     "View",
-    ["Gamma density (strike axis)", "VS3D forward gradient (decays to expiry)"],
+    ["Gamma density (strike axis)", "Net-GEX gradient (price × candles)"],
     horizontal=True,
 )
 
@@ -1375,27 +1375,25 @@ else:
         ("Downside HW", dhw["downside_hedge_wall"] if dhw else None,  "#66dd66", "--"),
         ("K*",          res["K_star"],                                "#66ccff", ":"),
     ]
-    cc1, cc2, cc3 = st.columns(3)
-    band = cc1.slider("Price band ±%", 1.0, 6.0, 2.5, step=0.5)
-    ntime = cc2.slider("Time resolution (columns)", 40, 200, 90, step=10)
-    contrast = cc3.slider("Contrast (percentile clip)", 80.0, 99.0, 92.0, step=1.0)
+    cc1, cc2 = st.columns(2)
+    band = cc1.slider("Price band ±%", 1.0, 6.0, 4.0, step=0.5)
+    smooth = cc2.slider("Smoothing (0 = raw per-strike bumps)", 0.0, 3.0, 0.6, step=0.1)
     try:
         with st.spinner(f"Fetching {candle_bars} × {candle_interval} candles…"):
             candles = fetch_candles(tv_symbol, tv_exchange, tv,
                                     candle_interval, candle_bars, token)
-        title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX forward "
-                 f"gradient → expiry {expiry}  |  {ist_str}")
+        title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX gradient  "
+                 f"| expiry {expiry}  |  {ist_str}")
         figp = build_forward_gradient_figure(
-            candles, res["sim_legs"], spot, res["expiry_dt"], risk_free, levels,
-            title, band_pct=band, n_time=int(ntime), pct=float(contrast))
+            candles, gex_df, spot, vol_trigger, levels, title,
+            band_pct=band, smooth=smooth)
         st.pyplot(figp, use_container_width=True)
         plt.close(figp)
-        st.caption("Forward simulation: each time column recomputes net GEX via "
-                   "Black-Scholes at its own time-to-expiry (per-strike NSE IV, "
-                   "OI-weighted), so the green/red seam sharpens toward the "
-                   f"{expiry} expiry (blue dotted line). Candles are real history. "
-                   "Green = +ve gamma / red = −ve (calls-plus / puts-minus "
-                   "convention, not participant-signed).")
+        st.caption("Horizontal color-map of the Net GEX profile: green = +ve net "
+                   "GEX (dampening), red = −ve (amplifying), black seam = the gamma "
+                   "flip / vol trigger. Per-strike structure (walls, pin) preserved; "
+                   "candles overlaid. Calls-plus / puts-minus convention, not "
+                   "participant-signed.")
     except Exception as e:
         st.error(f"Could not build gradient view: {e}")
 
