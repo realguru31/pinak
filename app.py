@@ -645,10 +645,19 @@ def fetch_option_chain_v3(expiry, token):
         try:
             s = _nse_session()
             r = s.get(url, timeout=15)
-            r.raise_for_status()
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                time.sleep(1.0)
+                continue
+            ct = r.headers.get("Content-Type", "")
+            if "json" not in ct.lower() and not r.text.lstrip().startswith("{"):
+                last_err = "NSE returned non-JSON (likely a bot/IP block page)"
+                time.sleep(1.0)
+                continue
             data = r.json()
             if data and "records" in data:
                 return data
+            last_err = "response had no 'records'"
         except Exception as e:
             last_err = e
             time.sleep(1.0)
@@ -1014,8 +1023,30 @@ st.caption("Spot via tvdatafeed (NSE:NIFTY) · Option chain via NSE · "
            "Gravity centres · Pin · Floor/Ceiling · Hedge walls · DgammaDtime")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
+if "token" not in st.session_state:
+    st.session_state["token"] = 0.0
+
 with st.sidebar:
     st.header("Settings")
+
+    st.subheader("Expiry")
+    manual_opts = next_n_days_expiries(20)
+    try_auto = st.checkbox(
+        "Try NSE auto-detect", value=False,
+        help="Attempt to fetch NSE's valid expiry list. If it fails (cloud IP "
+             "block), the manual next-20-days list below is used instead.")
+    expiry_options = manual_opts
+    if try_auto:
+        try:
+            with st.spinner("Auto-detecting expiries…"):
+                expiry_options = fetch_expiry_list(st.session_state["token"])
+        except Exception as e:
+            st.warning(f"Auto-detect failed — using manual list.\n\n{e}")
+            expiry_options = manual_opts
+    expiry = st.selectbox("Expiry date", expiry_options,
+                          index=default_expiry_index(expiry_options))
+    st.caption("NIFTY weekly expiry = Tuesday · monthly = last Tuesday. "
+               "Pick a valid expiry date.")
 
     st.subheader("tvdatafeed (spot source)")
     tv_symbol = st.text_input("Symbol", value="NIFTY")
@@ -1033,8 +1064,6 @@ with st.sidebar:
     auto = st.checkbox("Auto-refresh", value=False)
     interval = st.slider("Auto-refresh every (sec)", 15, 300, 60, disabled=not auto)
 
-if "token" not in st.session_state:
-    st.session_state["token"] = 0.0
 token = st.session_state["token"]
 
 if auto:
