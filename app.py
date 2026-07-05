@@ -553,6 +553,23 @@ def _to_v3_expiry(exp):
     return exp
 
 
+def next_n_days_expiries(n=20):
+    """Next n calendar days as NSE expiry strings ('DD-Mon-YYYY') for the manual picker."""
+    today = datetime.now().date()
+    return [(today + timedelta(days=i)).strftime("%d-%b-%Y") for i in range(n)]
+
+
+def default_expiry_index(options):
+    """Index of the nearest Tuesday (usual NIFTY weekly expiry) in options; else 0."""
+    for i, s in enumerate(options):
+        try:
+            if datetime.strptime(s, "%d-%b-%Y").weekday() == 1:  # Tuesday
+                return i
+        except ValueError:
+            continue
+    return 0
+
+
 def _expiry_candidates(days_ahead=50):
     """Upcoming Tuesdays & Thursdays — backup seeds covering current & legacy NIFTY expiry regimes."""
     today = datetime.now().date()
