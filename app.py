@@ -535,6 +535,27 @@ def fetch_vol_from_tv(symbol, exchange, _tv, token):
     return (iv or 0.20), (rv or iv or 0.20)
 
 
+# Friendly-name -> tvDatafeed.Interval attribute
+_TV_INTERVALS = {
+    "1 min":  "in_1_minute",
+    "5 min":  "in_5_minute",
+    "15 min": "in_15_minute",
+    "1 hour": "in_1_hour",
+    "1 day":  "in_daily",
+}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_candles(symbol, exchange, _tv, interval_name, n_bars, token):
+    """OHLC candles for the price view (time-series) from tvdatafeed."""
+    from tvDatafeed import Interval
+    iv = getattr(Interval, _TV_INTERVALS.get(interval_name, "in_15_minute"))
+    df = _tv.get_hist(symbol=symbol, exchange=exchange, interval=iv, n_bars=n_bars)
+    if df is None or df.empty:
+        raise RuntimeError("tvdatafeed returned no candles.")
+    return df
+
+
 def _nse_session():
     s = requests.Session()
     s.headers.update(NSE_HEADERS)
@@ -963,10 +984,70 @@ def build_gamma_figure(gex_df, spot, K_star, F_at_Kstar, ticker, exp_str,
 
 
 # =============================================================================
-# ANALYTICS PIPELINE  (orchestrates everything, cached)
+# PRICE VIEW  (spot candlesticks over time + horizontal GEX levels)
 # =============================================================================
 
-@st.cache_data(show_spinner=False)
+def build_price_levels_figure(candles, levels, title):
+    """
+    Second view: NIFTY spot as candlesticks (x = time, y = price) with the GEX
+    levels drawn as horizontal price lines. The strike-view's vertical lines are
+    horizontal here — the same levels, flipped onto a price chart.
+    """
+    o = candles["open"].to_numpy(dtype=float)
+    h = candles["high"].to_numpy(dtype=float)
+    l = candles["low"].to_numpy(dtype=float)
+    c = candles["close"].to_numpy(dtype=float)
+    x = np.arange(len(candles))
+    idx = candles.index
+
+    fig, ax = plt.subplots(figsize=(20, 11))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    UP, DN = "#137333", "#c5221f"
+    body_w = 0.62
+    rng = float(np.nanmax(h) - np.nanmin(l)) or 1.0
+    min_body = rng * 0.0008  # so dojis remain visible
+
+    for i in range(len(x)):
+        col = UP if c[i] >= o[i] else DN
+        ax.plot([x[i], x[i]], [l[i], h[i]], color=col, lw=0.9, zorder=3)  # wick
+        lo, hi = (o[i], c[i]) if c[i] >= o[i] else (c[i], o[i])
+        ax.add_patch(plt.Rectangle((x[i] - body_w / 2, lo), body_w,
+                                   max(hi - lo, min_body),
+                                   facecolor=col, edgecolor=col, zorder=4))
+
+    right = len(x) - 0.5
+    for lbl, price, color, ls in levels:
+        if price is None or not np.isfinite(price):
+            continue
+        ax.axhline(price, color=color, ls=ls, lw=1.8, alpha=0.9, zorder=5)
+        ax.text(right, price, f"  {lbl} {price:,.0f}", va="center", ha="left",
+                fontsize=8, color="white", fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.25", fc=color, ec="white",
+                          lw=0.8, alpha=0.92), zorder=6)
+
+    step = max(1, len(x) // 12)
+    ticks = list(range(0, len(x), step))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([idx[t].strftime("%d-%b %H:%M") for t in ticks],
+                       rotation=45, ha="right", fontsize=8)
+    ax.set_xlim(-1, len(x) + max(6, len(x) * 0.14))  # room for right-side labels
+
+    lvl_prices = [p for _, p, _, _ in levels if p is not None and np.isfinite(p)]
+    ymin = min(float(np.nanmin(l)), min(lvl_prices) if lvl_prices else float(np.nanmin(l)))
+    ymax = max(float(np.nanmax(h)), max(lvl_prices) if lvl_prices else float(np.nanmax(h)))
+    pad = (ymax - ymin) * 0.05 or 1.0
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+    ax.set_xlabel("Time", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Price", fontsize=12, fontweight="bold")
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.grid(True, axis="y", alpha=0.30, ls="--", lw=0.5, color="#cccccc")
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#aaaaaa")
+    fig.tight_layout()
+    return fig
 def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
                  strike_hi, token):
     # v3 response is already scoped to the requested expiry — no client-side filter
@@ -1055,6 +1136,11 @@ with st.sidebar:
     st.subheader("Model")
     risk_free = st.number_input("Risk-free rate", value=RISK_FREE_RATE_DEFAULT,
                                 min_value=0.0, max_value=0.20, step=0.005, format="%.3f")
+
+    st.subheader("Price view (candles)")
+    candle_interval = st.selectbox("Candle interval",
+                                   list(_TV_INTERVALS.keys()), index=2)  # 15 min
+    candle_bars = st.slider("Candles (bars)", 30, 500, 150, step=10)
 
     st.subheader("Refresh")
     if st.button("🔄 Refresh data now", use_container_width=True):
@@ -1175,13 +1261,50 @@ k2[5].metric("Downside HW", f"{dhw['downside_hedge_wall']:,.0f}" if dhw else "N/
 # ── Chart ────────────────────────────────────────────────────────────────────
 ist_str = (datetime.now(pytz.utc).astimezone(pytz.timezone("Asia/Kolkata"))
            .strftime("%d-%b-%Y %H:%M IST"))
-fig = build_gamma_figure(
-    gex_df, spot, res["K_star"], res["F_at_Kstar"],
-    f"{tv_exchange}:{tv_symbol}", expiry, res["exp_label"], ist_str,
-    strike_lo, strike_hi, sigma_upper=res["sig_up"], sigma_lower=res["sig_dn"],
-    vol_trigger=vol_trigger, gravity=gravity, pin=pin, fc=fc, hw=hw, dhw=dhw)
-st.pyplot(fig, use_container_width=True)
-plt.close(fig)
+
+view = st.radio(
+    "View",
+    ["Gamma density (strike axis)", "Price + GEX levels (candles)"],
+    horizontal=True,
+)
+
+if view == "Gamma density (strike axis)":
+    fig = build_gamma_figure(
+        gex_df, spot, res["K_star"], res["F_at_Kstar"],
+        f"{tv_exchange}:{tv_symbol}", expiry, res["exp_label"], ist_str,
+        strike_lo, strike_hi, sigma_upper=res["sig_up"], sigma_lower=res["sig_dn"],
+        vol_trigger=vol_trigger, gravity=gravity, pin=pin, fc=fc, hw=hw, dhw=dhw)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+else:
+    # Same levels as the strike view, drawn as horizontal price lines.
+    levels = [
+        ("Spot",        spot,                                 "#c400c4", "--"),
+        ("Vol Trigger", vol_trigger,                          "#0066cc", "-"),
+        ("Call Wall",   gravity["call_wall"],                 "#e03000", "--"),
+        ("Put Wall",    gravity["put_wall"],                  "#1a6bbf", "--"),
+        ("Pin",         pin["pin_strike"],                    "#FF6600", "-"),
+        ("Ceiling",     fc["ceiling"],                        "#D35400", "--"),
+        ("Floor",       fc["floor"],                          "#148F77", "--"),
+        ("Upside HW",   hw["hedge_wall"] if hw else None,     "#8B008B", "--"),
+        ("Downside HW", dhw["downside_hedge_wall"] if dhw else None, "#006400", "--"),
+        ("+1σ",         res["sig_up"],                        "#3a7d00", ":"),
+        ("-1σ",         res["sig_dn"],                        "#b8860b", ":"),
+        ("K*",          res["K_star"],                        "#0077bb", ":"),
+    ]
+    try:
+        with st.spinner(f"Fetching {candle_bars} × {candle_interval} candles…"):
+            candles = fetch_candles(tv_symbol, tv_exchange, tv,
+                                    candle_interval, candle_bars, token)
+        title = (f"{tv_exchange}:{tv_symbol}  spot candles ({candle_interval})  "
+                 f"+ GEX levels for expiry {expiry}  |  {ist_str}")
+        figp = build_price_levels_figure(candles, levels, title)
+        st.pyplot(figp, use_container_width=True)
+        plt.close(figp)
+        st.caption("GEX levels (horizontal) are computed from the option chain for "
+                   "the selected expiry; candles are live spot from tvdatafeed.")
+    except Exception as e:
+        st.error(f"Could not build price view: {e}")
 
 # ── Details / table ──────────────────────────────────────────────────────────
 with st.expander("Gravity centres · Pin · Floor/Ceiling · Hedge walls (detail)"):
