@@ -1026,17 +1026,16 @@ _GEX_CMAP = LinearSegmentedColormap.from_list("vs3d_gex", [
 
 
 def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
-                                  title, band_pct=4.0, n_price=400, smooth=0.6):
+                                  title, band_pct=4.0, n_price=400, smooth=0.6,
+                                  cone_mode=True, cone_gain=4.5):
     """
-    Horizontal color-map of the **Net GEX** profile (image-2's Neutral-Gamma
-    curve, rotated 90°): y = price, color = net GEX at that price level.
-      green  = +ve net GEX  (dealers long gamma, dampening)
-      red    = -ve net GEX  (dealers short gamma, amplifying)
-      black  = the zero seam == the vol trigger / gamma flip
-    Per-strike detail (the bumps: walls, pin) is PRESERVED — only light
-    interpolation smoothing. The same profile is painted across the full time
-    width so candles overlay on top. (Not the forward BS decay — structure,
-    not decay, is the point here.)
+    Net-GEX field behind spot candles. y = price, green = +ve net GEX (dampening),
+    red = -ve (amplifying), black seam = the flip / vol trigger.
+      cone_mode=False : flat horizontal color-bands (net GEX painted at each price)
+      cone_mode=True  : vs3d tanh "cone" — each price level reaches horizontally in
+                        proportion to |net GEX|, tails coming in from the right edge,
+                        giving the tapering cone from the strike-view profile.
+    Per-strike structure (walls, pin) preserved (light smoothing only).
     """
     import matplotlib.dates as mdates
 
@@ -1061,8 +1060,20 @@ def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
 
     # ---- normalize about ZERO so the seam is exactly at net GEX = 0 (the flip) ----
     scale = np.percentile(np.abs(prof), 98) or 1.0
-    col = np.clip(prof / scale, -1.0, 1.0)          # -1..1, 0 -> black seam
-    field = np.tile(col[:, None], (1, 8))            # constant across time width
+    col = np.clip(prof / scale, -1.0, 1.0)           # -1..1, 0 -> black seam
+
+    if cone_mode:
+        # vs3d field_from_profile: each price row "reaches" across x in proportion
+        # to |net GEX| -> tapering cone. Preserve sign (green +/red -).
+        n_x = 360
+        mag = np.abs(col)                            # 0..1 reach per price row
+        xs = np.linspace(0.0, 1.0, n_x)
+        reach = np.tanh(cone_gain * (mag[:, None] - xs[None, :]))   # -1..1 glow
+        reach = np.clip(reach, 0.0, 1.0)             # 0..1 intensity mask
+        field = reach * np.sign(col)[:, None]        # apply sign -> -1..1
+        field = field[:, ::-1]                       # tails reach in from the RIGHT
+    else:
+        field = np.tile(col[:, None], (1, 8))        # flat color-bands across time
 
     # ---- time extent from the candles ----
     idx = candles.index
@@ -1129,6 +1140,75 @@ def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
         sp.set_edgecolor("#444444")
     fig.tight_layout()
     return fig
+
+
+# =============================================================================
+# POSITIONING LADDER  — pre-trade support/resistance read (net GEX by strike)
+# =============================================================================
+
+def build_positioning_ladder(gex_df, spot, vol_trigger, pin, levels,
+                             n_strikes=16):
+    """
+    Trader's glance view: net GEX as horizontal bars per strike near spot.
+      +ve net GEX (green) points RIGHT  = resistance / dampening above
+      -ve net GEX (red)   points LEFT   = support / amplifying below
+    Spot, flip (vol trigger) and pin marked. Answers "nearest wall each way and
+    how strong" without reading the full strike chart.
+    """
+    d = gex_df.copy()
+    d["dist"] = (d["strike"] - spot).abs()
+    d = d.nsmallest(n_strikes, "dist").sort_values("strike")
+    ks = d["strike"].to_numpy(dtype=float)
+    net = d["net_gex"].to_numpy(dtype=float)
+    scale = np.percentile(np.abs(net), 95) or 1.0
+    xn = net / scale                                   # normalized bar length
+
+    fig, ax = plt.subplots(figsize=(11, 9))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    colors = ["#1a9e4b" if v >= 0 else "#d1332e" for v in xn]
+    ax.barh(ks, xn, height=38, color=colors, edgecolor="white", linewidth=0.5, zorder=3)
+    ax.axvline(0, color="#333333", lw=1.2, zorder=2)
+
+    # spot / flip / pin markers
+    ax.axhline(spot, color="#c400c4", ls="--", lw=2.0, zorder=4)
+    ax.text(1.02, spot, f"Spot {spot:,.0f}", transform=ax.get_yaxis_transform(),
+            va="center", ha="left", color="white", fontsize=9, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.25", fc="#c400c4", ec="none"))
+    if vol_trigger is not None:
+        ax.axhline(vol_trigger, color="#0066cc", ls="-", lw=2.0, zorder=4)
+        ax.text(1.02, vol_trigger, f"Flip {vol_trigger:,.0f}",
+                transform=ax.get_yaxis_transform(), va="center", ha="left",
+                color="white", fontsize=9, fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.25", fc="#0066cc", ec="none"))
+    if pin is not None:
+        ax.axhline(pin["pin_strike"], color="#ff8800", ls=":", lw=2.0, zorder=4)
+        ax.text(1.02, pin["pin_strike"], f"Pin {pin['pin_strike']:,.0f}",
+                transform=ax.get_yaxis_transform(), va="center", ha="left",
+                color="white", fontsize=9, fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.25", fc="#ff8800", ec="none"))
+
+    # value labels on the bars
+    for k, v in zip(ks, xn):
+        ax.text(v + (0.03 if v >= 0 else -0.03), k, f"{k:,.0f}",
+                va="center", ha="left" if v >= 0 else "right",
+                fontsize=7, color="#333333")
+
+    ax.set_xlim(-1.25, 1.25)
+    ax.set_ylim(ks.min() - 40, ks.max() + 40)
+    ax.set_xlabel("← support (−net GEX)      resistance (+net GEX) →",
+                  fontsize=11, fontweight="bold")
+    ax.set_ylabel("Strike", fontsize=11, fontweight="bold")
+    ax.set_title("Positioning ladder — net GEX by strike (near spot)",
+                 fontsize=12, fontweight="bold", loc="left")
+    ax.set_xticks([])
+    ax.grid(True, axis="y", alpha=0.25, ls="--", lw=0.5)
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#bbbbbb")
+    fig.tight_layout()
+    return fig
+
 
 @st.cache_data(show_spinner=False)
 def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
@@ -1365,7 +1445,8 @@ ist_str = (datetime.now(pytz.utc).astimezone(pytz.timezone("Asia/Kolkata"))
 
 view = st.radio(
     "View",
-    ["Gamma density (strike axis)", "Net-GEX gradient (price × candles)"],
+    ["Gamma density (strike axis)", "Net-GEX gradient (price × candles)",
+     "Positioning ladder"],
     horizontal=True,
 )
 
@@ -1377,6 +1458,15 @@ if view == "Gamma density (strike axis)":
         vol_trigger=vol_trigger, gravity=gravity, pin=pin, fc=fc, hw=hw, dhw=dhw)
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
+elif view == "Positioning ladder":
+    figl = build_positioning_ladder(gex_df, spot, vol_trigger, pin, None)
+    lc, _ = st.columns([2, 1])
+    with lc:
+        st.pyplot(figl, use_container_width=True)
+    plt.close(figl)
+    st.caption("Nearest support/resistance at a glance: green bars (right) = +net "
+               "GEX resistance above, red bars (left) = −net GEX support below. "
+               "Longer bar = stronger wall. Spot, flip and pin marked.")
 else:
     levels = [
         ("Spot",        spot,                                         "#c400c4", "--"),
@@ -1390,9 +1480,11 @@ else:
         ("Downside HW", dhw["downside_hedge_wall"] if dhw else None,  "#66dd66", "--"),
         ("K*",          res["K_star"],                                "#66ccff", ":"),
     ]
-    cc1, cc2 = st.columns(2)
+    cc1, cc2, cc3 = st.columns(3)
     band = cc1.slider("Price band ±%", 1.0, 6.0, 4.0, step=0.5)
     smooth = cc2.slider("Smoothing (0 = raw per-strike bumps)", 0.0, 3.0, 0.6, step=0.1)
+    cone_on = cc3.checkbox("Cone mode (tapering glow)", value=True)
+    cone_gain = cc3.slider("Cone gain", 2.0, 8.0, 4.5, step=0.5, disabled=not cone_on)
     try:
         with st.spinner(f"Fetching {candle_bars} × {candle_interval} candles…"):
             candles = fetch_candles(tv_symbol, tv_exchange, tv,
@@ -1401,14 +1493,14 @@ else:
                  f"| expiry {expiry}  |  {ist_str}")
         figp = build_forward_gradient_figure(
             candles, gex_df, spot, vol_trigger, levels, title,
-            band_pct=band, smooth=smooth)
+            band_pct=band, smooth=smooth, cone_mode=cone_on, cone_gain=cone_gain)
         st.pyplot(figp, use_container_width=True)
         plt.close(figp)
-        st.caption("Horizontal color-map of the Net GEX profile: green = +ve net "
-                   "GEX (dampening), red = −ve (amplifying), black seam = the gamma "
-                   "flip / vol trigger. Per-strike structure (walls, pin) preserved; "
-                   "candles overlaid. Calls-plus / puts-minus convention, not "
-                   "participant-signed.")
+        st.caption("Net-GEX field: green = +ve (dampening), red = −ve (amplifying), "
+                   "black seam = gamma flip / vol trigger. Cone mode = each price "
+                   "reaches horizontally in proportion to |net GEX| (tails from the "
+                   "right). Walls/pin preserved; candles overlaid. Calls-plus / "
+                   "puts-minus convention, not participant-signed.")
     except Exception as e:
         st.error(f"Could not build gradient view: {e}")
 
