@@ -984,14 +984,17 @@ def build_gamma_figure(gex_df, spot, K_star, F_at_Kstar, ticker, exp_str,
 
 
 # =============================================================================
-# PRICE VIEW  — VS3D-style net-GEX gradient "cone" field behind the candles
+# PRICE VIEW  — VS3D forward-simulation net-GEX gradient (decays to expiry)
 # =============================================================================
-# Pipeline (per the vs3d spec):
-#   1. density()          per-strike net gamma  ->  smoothed profile on a price grid
-#   2. field_from_profile() 1-D profile -> 2-D tanh "cone" field (90th-pctile scale)
-#   3. imshow the field behind the candles; candles + level lines on top
-# Signed net field -> diverging GEX colormap with BLACK at the midpoint (the
-# zero "seam"): green above the flip / red below.
+# The real vs3d Gradient Chart: each time column is genuinely recomputed with
+# Black-Scholes at T = time from that column to expiry, so the net-GEX seam
+# SHARPENS as it approaches expiry (T -> 0). Fields:
+#   grid  : price (y) × time (x, first candle -> expiry)
+#   value : Σ_legs  sign · OI · bs_gamma(P, K, T, iv) · 100 · P
+#   IV    : each strike's own IV from the NSE chain (fallback IV otherwise)
+#   weight: OI (NSE updates OI intraday)
+# Normalized by 92nd percentile (charm/gamma blow up as T->0; percentile clip
+# keeps it readable), diverging GEX colormap with a black seam at zero.
 
 from matplotlib.colors import LinearSegmentedColormap
 
@@ -1007,88 +1010,108 @@ _GEX_CMAP = LinearSegmentedColormap.from_list("vs3d_gex", [
 ])
 
 
-def _density(strikes, vals, pg, smooth=0.02):
-    """Per-strike values -> interpolated + gaussian-smoothed profile on price grid pg."""
-    order = np.argsort(strikes)
-    ks = np.asarray(strikes)[order]
-    vs = np.asarray(vals)[order]
-    p = np.interp(pg, ks, vs, left=0.0, right=0.0)
-    sig = len(pg) * smooth
-    return gaussian_filter1d(p, sig) if sig > 0.3 else p
+def _bs_gamma_grid(P, K, iv, T, r):
+    """Vectorized BS gamma over price grid P (n_price,) for strike arrays K, iv (n_legs,)."""
+    P = P[:, None]
+    K = K[None, :]
+    iv = iv[None, :]
+    sqrtT = np.sqrt(T)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d1 = (np.log(P / K) + (r + 0.5 * iv ** 2) * T) / (iv * sqrtT)
+        g = np.exp(-0.5 * d1 ** 2) / np.sqrt(2 * np.pi) / (P * iv * sqrtT)
+    return np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def _field_from_profile(vals, n_x=360, gain=4.5):
-    """1-D profile -> 2-D tanh cone field in [-1, 1]. 90th-pctile scaling (never max)."""
-    sc = np.percentile(np.abs(vals), 90) or 1.0
-    b = gaussian_filter1d(0.5 + 0.5 * np.tanh(vals / sc), 2.0)      # normalize -> 0..1
-    xs = np.linspace(0.0, 1.0, n_x)
-    return np.tanh(gain * (b[:, None] - xs[None, :]))              # rows fade across x
-
-
-def build_vs3d_gradient_figure(candles, gex_df, levels, spot, title,
-                               smooth=0.02, gain=4.5, mirror=True):
+def build_forward_gradient_figure(candles, sim_legs, spot, expiry_dt, r, levels,
+                                  title, band_pct=2.5, n_price=160, n_time=90,
+                                  pct=92.0):
     """
-    VS3D net-GEX gradient behind spot candles. y = price, x = session clock.
-    The cone tails reach in from the right edge (mirror=True) — the direction
-    you asked for — so strong gamma at a price glows inward toward the candles.
+    Forward-simulation net-GEX gradient behind spot candles. x runs from the
+    first candle time to the expiry; each column recomputes net GEX at its own
+    time-to-expiry, so the field decays/sharpens toward expiry.
     """
     import matplotlib.dates as mdates
 
-    # ---- price grid: spot ±2.5% (min 240 pts), clipped to available strikes ----
-    lo = min(spot * 0.975, float(gex_df["strike"].min()))
-    hi = max(spot * 1.025, float(gex_df["strike"].max()))
-    pg = np.linspace(lo, hi, 240)
+    if not sim_legs:
+        raise RuntimeError("No option legs available for the forward simulation.")
+    K = np.array([s for s, _, _, _ in sim_legs], dtype=float)
+    IV = np.array([v for _, v, _, _ in sim_legs], dtype=float)
+    W = np.array([oi * sgn for _, _, oi, sgn in sim_legs], dtype=float)  # signed OI
 
-    # ---- net gamma per strike, weighted by volume (fallback OI), ×100×spot ----
-    strikes = gex_df["strike"].to_numpy(dtype=float)
-    net = (gex_df["net_gex"].to_numpy(dtype=float))  # already call_gex - put_gex (×100×spot)
-    prof = _density(strikes, net, pg, smooth=smooth)
-    V = _field_from_profile(prof, gain=gain)          # (len(pg), n_x) in [-1, 1]
-    if mirror:
-        V = V[:, ::-1]                                # cone tails come from the RIGHT edge
+    # ---- price grid: spot ±band%, widened to include levels ----
+    lo = spot * (1 - band_pct / 100.0)
+    hi = spot * (1 + band_pct / 100.0)
+    lvl = [p for _, p, _, _ in levels if p is not None and np.isfinite(p)]
+    if lvl:
+        lo = min(lo, min(lvl)); hi = max(hi, max(lvl))
+    pg = np.linspace(lo, hi, n_price)
 
-    # ---- candle x on real date numbers so the field extent matches ----
+    # ---- time axis: first candle -> expiry (matplotlib date numbers, in days) ----
     idx = candles.index
-    x = mdates.date2num(idx.to_pydatetime())
-    x0, x1 = float(x[0]), float(x[-1])
-    if x1 <= x0:
-        x1 = x0 + 1.0 / (24 * 60)
+    xc = mdates.date2num(idx.to_pydatetime())
+    x0 = float(xc[0])
+    x1 = float(mdates.date2num(expiry_dt))
+    if x1 <= x0:                       # expiry already passed -> small forward window
+        x1 = float(xc[-1]) + 0.25
+    tcols = np.linspace(x0, x1, n_time)
+
+    # ---- forward field: recompute net GEX at each column's time-to-expiry ----
+    Z = np.zeros((n_price, n_time), dtype=float)
+    for j, tnum in enumerate(tcols):
+        T = max((x1 - tnum) / 365.0, MIN_T)          # years to expiry at this column
+        g = _bs_gamma_grid(pg, K, IV, T, r)          # (n_price, n_legs)
+        Z[:, j] = (g * (W * 100.0)[None, :]).sum(axis=1) * pg  # ·100·P, signed by OI
+
+    Z = gaussian_filter1d(Z, 1.2, axis=0)            # smooth along PRICE only
+    scale = np.percentile(np.abs(Z), pct) or 1.0     # percentile clip (not max)
+    Zn = np.clip(Z / scale, -1.0, 1.0)
 
     fig, ax = plt.subplots(figsize=(20, 10))
     fig.patch.set_facecolor("black")
     ax.set_facecolor("black")
 
-    ax.imshow(V, origin="lower", extent=[x0, x1, pg[0], pg[-1]], aspect="auto",
+    ax.imshow(Zn, origin="lower", extent=[x0, x1, pg[0], pg[-1]], aspect="auto",
               cmap=_GEX_CMAP, vmin=-1, vmax=1, interpolation="bilinear", zorder=0)
 
-    # ---- candles on top ----
+    # ---- candles (width from MEDIAN bar spacing so they don't overlap) ----
     o = candles["open"].to_numpy(dtype=float)
     h = candles["high"].to_numpy(dtype=float)
     l = candles["low"].to_numpy(dtype=float)
     c = candles["close"].to_numpy(dtype=float)
-    bw = (x1 - x0) / max(len(x), 2) * 0.7
-    for i in range(len(x)):
+    if len(xc) > 1:
+        bw = float(np.median(np.diff(xc))) * 0.7
+    else:
+        bw = (x1 - x0) / 100.0
+    wick_min = float(np.nanmean(h - l)) * 0.02 if len(h) else 0.01
+    for i in range(len(xc)):
         up = c[i] >= o[i]
-        body = "#e8e8e8" if up else "#111111"
-        edge = "#f5f5f5" if up else "#8a8a8a"
-        ax.plot([x[i], x[i]], [l[i], h[i]], color=edge, lw=0.8, zorder=5)
+        body = "#e8e8e8" if up else "#141414"
+        edge = "#f5f5f5" if up else "#9a9a9a"
+        ax.plot([xc[i], xc[i]], [l[i], h[i]], color=edge, lw=0.7, zorder=5)
         lo_b, hi_b = (o[i], c[i]) if up else (c[i], o[i])
-        ax.add_patch(plt.Rectangle((x[i] - bw / 2, lo_b), bw, max(hi_b - lo_b, (hi - l).mean() * 0.02),
-                                   facecolor=body, edgecolor=edge, lw=0.5, zorder=6))
+        ax.add_patch(plt.Rectangle((xc[i] - bw / 2, lo_b), bw,
+                                   max(hi_b - lo_b, wick_min),
+                                   facecolor=body, edgecolor=edge, lw=0.4, zorder=6))
 
-    # ---- spot + GEX level lines on top of the field ----
-    ax.axhline(spot, color="white", ls="--", lw=1.4, alpha=0.9, zorder=7)
-    trans = None
+    # ---- expiry marker + spot + level lines ----
+    ax.axvline(x1, color="#3399dd", ls=":", lw=1.4, alpha=0.9, zorder=7)
     from matplotlib.transforms import blended_transform_factory
     trans = blended_transform_factory(ax.transAxes, ax.transData)
-    for lbl, price, color, ls in levels:
-        if price is None or not np.isfinite(price) or not (pg[0] <= price <= pg[-1]):
-            continue
-        ax.axhline(price, color=color, ls=ls, lw=1.3, alpha=0.85, zorder=7)
-        ax.text(0.004, price, f"{lbl} {price:,.0f}", transform=trans, va="center",
-                ha="left", fontsize=8, color="white", fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.2", fc=color, ec="none", alpha=0.85),
-                zorder=8)
+    ax.axhline(spot, color="white", ls="--", lw=1.3, alpha=0.9, zorder=7)
+    # de-collide labels: skip a label if one was placed within 0.2% of this price
+    placed = []
+    for lbl, price, color, ls in sorted(
+            [(lbl, p, col, s) for (lbl, p, col, s) in levels
+             if p is not None and np.isfinite(p) and pg[0] <= p <= pg[-1]],
+            key=lambda t: t[1]):
+        ax.axhline(price, color=color, ls=ls, lw=1.2, alpha=0.85, zorder=7)
+        show = all(abs(price - q) > 0.002 * spot for q in placed)
+        if show:
+            ax.text(0.004, price, f"{lbl} {price:,.0f}", transform=trans, va="center",
+                    ha="left", fontsize=8, color="white", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.2", fc=color, ec="none", alpha=0.85),
+                    zorder=8)
+            placed.append(price)
 
     ax.set_ylim(pg[0], pg[-1])
     ax.set_xlim(x0, x1)
@@ -1098,7 +1121,8 @@ def build_vs3d_gradient_figure(candles, gex_df, levels, spot, title,
         lab.set_rotation(45); lab.set_ha("right"); lab.set_color("white"); lab.set_fontsize(8)
     ax.tick_params(colors="white")
     ax.set_ylabel("Price", color="white", fontsize=12, fontweight="bold")
-    ax.set_xlabel("Session time", color="white", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Time  (candles = history · field decays to expiry ⟶)",
+                  color="white", fontsize=11, fontweight="bold")
     ax.set_title(title, color="white", fontsize=12, fontweight="bold", loc="left")
     for sp in ax.spines.values():
         sp.set_edgecolor("#444444")
@@ -1143,11 +1167,29 @@ def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
     dhw = compute_downside_hedge_wall(gex_df, spot, gravity["put_wall"])
     K_star, F_at_Kstar, _ = find_optimal_strike_K_star(gex_df)
 
+    # --- per-strike legs for the forward-simulation gradient ---
+    # OI-weighted (NSE updates OI intraday), per-strike IV (NSE IV is in %, -> decimal),
+    # sign = +1 for calls, -1 for puts. Fallback IV when a strike has none.
+    def _legs(df, sign):
+        d = df[(df["strike"] >= strike_lo) & (df["strike"] <= strike_hi)]
+        out = []
+        for _, rr in d.iterrows():
+            iv = rr["impliedVolatility"]
+            iv = iv / 100.0 if iv > 3 else iv          # 12.34% -> 0.1234
+            if iv <= 0:
+                iv = fallback_iv
+            oi = rr["openInterest"]
+            if oi > 0 and iv > 0:
+                out.append((float(rr["strike"]), float(iv), float(oi), sign))
+        return out
+    sim_legs = _legs(calls, +1) + _legs(puts, -1)
+
     return {
         "gex_df": gex_df, "t_expiry": t_expiry, "exp_label": exp_label,
         "iv_market": iv_market, "sig_up": sig_up, "sig_dn": sig_dn,
         "vol_trigger": vol_trigger, "gravity": gravity, "pin": pin,
         "fc": fc, "hw": hw, "dhw": dhw, "K_star": K_star, "F_at_Kstar": F_at_Kstar,
+        "sim_legs": sim_legs, "expiry_dt": expiry_dt,
     }
 
 
@@ -1322,7 +1364,7 @@ ist_str = (datetime.now(pytz.utc).astimezone(pytz.timezone("Asia/Kolkata"))
 
 view = st.radio(
     "View",
-    ["Gamma density (strike axis)", "VS3D net-GEX gradient (candles)"],
+    ["Gamma density (strike axis)", "VS3D forward gradient (decays to expiry)"],
     horizontal=True,
 )
 
@@ -1347,24 +1389,27 @@ else:
         ("Downside HW", dhw["downside_hedge_wall"] if dhw else None,  "#66dd66", "--"),
         ("K*",          res["K_star"],                                "#66ccff", ":"),
     ]
-    cc1, cc2 = st.columns(2)
-    smooth = cc1.slider("Profile smoothing (low = per-strike detail)",
-                        0.005, 0.10, 0.02, step=0.005)
-    gain = cc2.slider("Cone glow (gain)", 2.0, 8.0, 4.5, step=0.5)
+    cc1, cc2, cc3 = st.columns(3)
+    band = cc1.slider("Price band ±%", 1.0, 6.0, 2.5, step=0.5)
+    ntime = cc2.slider("Time resolution (columns)", 40, 200, 90, step=10)
+    contrast = cc3.slider("Contrast (percentile clip)", 80.0, 99.0, 92.0, step=1.0)
     try:
         with st.spinner(f"Fetching {candle_bars} × {candle_interval} candles…"):
             candles = fetch_candles(tv_symbol, tv_exchange, tv,
                                     candle_interval, candle_bars, token)
-        title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX gradient  "
-                 f"| expiry {expiry}  |  {ist_str}")
-        figp = build_vs3d_gradient_figure(candles, gex_df, levels, spot, title,
-                                          smooth=smooth, gain=gain, mirror=True)
+        title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX forward "
+                 f"gradient → expiry {expiry}  |  {ist_str}")
+        figp = build_forward_gradient_figure(
+            candles, res["sim_legs"], spot, res["expiry_dt"], risk_free, levels,
+            title, band_pct=band, n_time=int(ntime), pct=float(contrast))
         st.pyplot(figp, use_container_width=True)
         plt.close(figp)
-        st.caption("Net-GEX cone field (green = +ve gamma / red = −ve, black seam = "
-                   "flip) behind spot candles, per the vs3d gradient technique. Cone "
-                   "tails reach in from the right edge. Not participant-signed — green/"
-                   "red is the calls-plus / puts-minus convention.")
+        st.caption("Forward simulation: each time column recomputes net GEX via "
+                   "Black-Scholes at its own time-to-expiry (per-strike NSE IV, "
+                   "OI-weighted), so the green/red seam sharpens toward the "
+                   f"{expiry} expiry (blue dotted line). Candles are real history. "
+                   "Green = +ve gamma / red = −ve (calls-plus / puts-minus "
+                   "convention, not participant-signed).")
     except Exception as e:
         st.error(f"Could not build gradient view: {e}")
 
