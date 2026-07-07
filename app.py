@@ -1368,6 +1368,28 @@ def compute_oi_flow(snaps, tick=0.05):
             "t0": snaps[0]["ts"], "t1": snaps[-1]["ts"]}
 
 
+def quadrant_signed_legs(sim_legs, flow):
+    """
+    Replace the blanket calls+/puts− dealer convention with the integrated
+    quadrant inference per strike-leg. Dominance dom ∈ [−1,+1] (writer=+1) IS
+    the dealer side: customers writing → dealers long → +γ; customers buying →
+    dealers short → −γ — regardless of call/put. Blend with the convention where
+    the inference is weak:  s_eff = dom + (1−|dom|)·conv  (dom=0 → convention;
+    dom=±1 → fully inferred). This is what turns the clean green/red split into
+    the organic pockets — and it is a PRIOR, not clearing data.
+    """
+    if flow is None:
+        return sim_legs, False
+    t = flow["table"].set_index("strike")
+    out = []
+    for (K, iv, oi, vol, sgn) in sim_legs:
+        leg = "ce" if sgn > 0 else "pe"
+        dom = float(t[f"{leg}_dom"].get(K, 0.0)) if K in t.index else 0.0
+        s_eff = dom + (1.0 - abs(dom)) * sgn
+        out.append((K, iv, oi, vol, s_eff))
+    return out, True
+
+
 def _dom_color(score):
     if score >= 0.15:
         return "#ff9f1c"     # writer-dominated (amber)
@@ -1756,6 +1778,12 @@ else:
     show_bars = cc2.slider("Zoom: show last N bars", 20, int(candle_bars),
                            min(120, int(candle_bars)), step=10)
     smooth = cc2.slider("Profile smoothing σ", 0.0, 6.0, 2.5, step=0.5)
+    sign_src = cc2.selectbox(
+        "Dealer sign",
+        ["Convention (calls+ / puts−)", "Quadrant inference (live OI)"],
+        help="Quadrant: per-strike writer/buyer dominance from OI snapshots sets "
+             "the dealer side (organic pockets). A prior, not clearing data; "
+             "needs ≥2 snapshots, else falls back to convention.")
     cone_on = cc3.checkbox("Cone mode", value=True)
     glow_on = cc3.checkbox("Glow (|profile| brightness)", value=True, disabled=not cone_on)
     tails_right = cc3.checkbox("Tails from right", value=True, disabled=not cone_on)
@@ -1765,10 +1793,20 @@ else:
             candles = fetch_candles(tv_symbol, tv_exchange, tv,
                                     candle_interval, candle_bars, token)
         candles = candles.tail(int(show_bars))          # time zoom
+        legs_used = res["sim_legs"]
+        sign_tag = "convention"
+        if sign_src.startswith("Quadrant"):
+            flow_g = compute_oi_flow(_snaps)
+            legs_used, ok = quadrant_signed_legs(res["sim_legs"], flow_g)
+            if ok:
+                sign_tag = f"quadrant·{flow_g['n_snaps']}snaps"
+            else:
+                st.warning("Quadrant sign needs ≥2 OI snapshots — using the "
+                           "convention until they accumulate (~3 min apart).")
         title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX gradient "
-                 f"[{method}]  | expiry {expiry}  |  {ist_str}")
+                 f"[{method} · {sign_tag}]  | expiry {expiry}  |  {ist_str}")
         figp = build_forward_gradient_figure(
-            candles, res["sim_legs"], res["t_expiry"], spot, levels, title,
+            candles, legs_used, res["t_expiry"], spot, levels, title,
             method=method, band_pct=band, smooth=smooth, cone_mode=cone_on,
             cone_gain=cone_gain, glow=glow_on, tails_right=tails_right)
         st.pyplot(figp, use_container_width=True)
