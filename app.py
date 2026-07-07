@@ -719,6 +719,87 @@ def fetch_option_chain_v3(expiry, token):
     raise RuntimeError(f"NSE v3 option-chain fetch failed: {last_err}")
 
 
+# ---- Participant-wise EOD OI (verified in Colab 07-Jul-2026) -----------------
+# https://archives.nseindia.com/content/nsccl/fao_participant_oi_DDMMYYYY.csv
+# 200 for the last trading day; today's file doesn't exist until EOD. Line 1 is
+# a title row; header row 2 carries: Client Type, Future Index Long/Short, ...,
+# Option Index Call Long, Option Index Put Long, Option Index Call Short,
+# Option Index Put Short, ... per Client / DII / FII / Pro.
+
+PART_OI_URL = "https://archives.nseindia.com/content/nsccl/fao_participant_oi_{ds}.csv"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_participant_oi(token):
+    """Latest available participant-wise EOD OI. Returns (df, date) or raises."""
+    import io
+    last_err = None
+    for back in range(0, 7):
+        d = (datetime.now() - timedelta(days=back)).date()
+        url = PART_OI_URL.format(ds=d.strftime("%d%m%Y"))
+        try:
+            r = requests.get(url, headers={"User-Agent": NSE_HEADERS["User-Agent"]},
+                             timeout=15)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code} for {d}"
+                continue
+            df = pd.read_csv(io.StringIO(r.text), skiprows=1)
+            df.columns = [c.strip() for c in df.columns]
+            df["Client Type"] = df["Client Type"].astype(str).str.strip()
+            df = df[df["Client Type"].isin(["Client", "DII", "FII", "Pro"])]
+            for c in df.columns[1:]:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            return df.set_index("Client Type"), d
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"participant OI unavailable: {last_err}")
+
+
+def participant_prior(df):
+    """
+    Overnight calibration per the spec: who is net-short index futures, who is
+    net-writing index calls/puts. Net option WRITING per participant =
+    Short − Long (index options), i.e. positive = net writer.
+    """
+    out = pd.DataFrame(index=df.index)
+    out["fut_net_long"] = df["Future Index Long"] - df["Future Index Short"]
+    out["call_net_written"] = df["Option Index Call Short"] - df["Option Index Call Long"]
+    out["put_net_written"] = df["Option Index Put Short"] - df["Option Index Put Long"]
+    out["net_written_total"] = out["call_net_written"] + out["put_net_written"]
+    return out
+
+
+def build_participant_figure(prior, asof):
+    """Grouped horizontal bars: index-futures net long, net calls written,
+    net puts written — per FII / DII / Pro / Client."""
+    order = [p for p in ["FII", "Pro", "Client", "DII"] if p in prior.index]
+    p = prior.loc[order]
+    y = np.arange(len(order), dtype=float)
+    h = 0.25
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    fig.patch.set_facecolor("white")
+    ax.barh(y + h, p["fut_net_long"] / 1e3, height=h, color="#4c6ef5",
+            label="Index futures net LONG (k)")
+    ax.barh(y, p["call_net_written"] / 1e3, height=h, color="#ff9f1c",
+            label="Index CALLS net written (k)")
+    ax.barh(y - h, p["put_net_written"] / 1e3, height=h, color="#e03131",
+            label="Index PUTS net written (k)")
+    ax.axvline(0, color="#333", lw=1.0)
+    ax.set_yticks(y)
+    ax.set_yticklabels(order, fontsize=11, fontweight="bold")
+    ax.set_xlabel("contracts (thousands) · positive = long futures / net writer",
+                  fontsize=10, fontweight="bold")
+    ax.set_title(f"Participant-wise EOD prior · {asof:%d-%b-%Y} "
+                 f"(overnight calibration for intraday quadrant inference)",
+                 fontsize=11, fontweight="bold", loc="left")
+    ax.legend(fontsize=8, loc="lower right", framealpha=0.9)
+    ax.grid(True, axis="x", alpha=0.3, ls="--", lw=0.5)
+    for sp_ in ax.spines.values():
+        sp_.set_edgecolor("#bbbbbb")
+    fig.tight_layout()
+    return fig
+
+
 def parse_options(json_data, field_mappings, expiry_filter=None):
     calls, puts = [], []
     if json_data and "records" in json_data and "data" in json_data["records"]:
@@ -1739,6 +1820,24 @@ if view == "OI flow (ΔOI · quadrant)":
                    "scalper round-trips, low churn + big ΔOI = real positioning. "
                    "Dominance is a PRIOR, not clearing data: NSE writers are "
                    "heterogeneous and not all delta-hedge mechanically.")
+
+    # ---- participant-wise EOD prior (overnight calibration) ----
+    st.markdown("---")
+    try:
+        pdf_, asof_ = fetch_participant_oi(token)
+        prior_ = participant_prior(pdf_)
+        figpp = build_participant_figure(prior_, asof_)
+        pc_, _ = st.columns([3, 1])
+        with pc_:
+            st.pyplot(figpp, use_container_width=True)
+        plt.close(figpp)
+        top_writer = prior_["net_written_total"].idxmax()
+        st.caption(f"EOD {asof_:%d-%b}: heaviest net index-option writer = "
+                   f"**{top_writer}**. Use as the overnight prior: e.g. FII net-"
+                   "short futures + heavy call writing = defensive book; squeeze "
+                   "risk if writer-dominated strikes break intraday.")
+    except Exception as e:
+        st.info(f"Participant EOD prior unavailable right now: {e}")
 elif view == "Gamma density (strike axis)":
     fig = build_gamma_figure(
         gex_df, spot, res["K_star"], res["F_at_Kstar"],
