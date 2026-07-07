@@ -748,7 +748,8 @@ def _clean_df(rows):
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    for col in ["strike", "impliedVolatility", "openInterest", "lastPrice"]:
+    for col in ["strike", "impliedVolatility", "openInterest", "lastPrice",
+                "totalTradedVolume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     return df
@@ -1032,72 +1033,119 @@ def build_gamma_figure(gex_df, spot, K_star, F_at_Kstar, ticker, exp_str,
 
 from matplotlib.colors import LinearSegmentedColormap
 
-# GEX colormap — near-zero is DARK-COLORED (not black); only a thin seam stays
-# near-black. Strong +GEX -> bright green, strong -GEX -> bright red. This kills
-# the dead black space while keeping the flip readable as a thin seam.
+# exact vs3d GEX colormap (red -> black seam -> green). The cone GLOW multiplier
+# (0.55 + 0.45·|profile|) keeps weak regions dim-but-coloured, so no dead black.
 _GEX_CMAP = LinearSegmentedColormap.from_list("vs3d_gex", [
-    (0.00, (0.95, 0.15, 0.12)),   # strong -GEX  -> bright red
-    (0.30, (0.55, 0.05, 0.04)),   # mid red
-    (0.46, (0.18, 0.02, 0.02)),   # faint -GEX   -> dark red (NOT black)
-    (0.50, (0.02, 0.02, 0.02)),   # thin seam    -> near-black flip line
-    (0.54, (0.02, 0.16, 0.04)),   # faint +GEX   -> dark green (NOT black)
-    (0.70, (0.06, 0.50, 0.14)),   # mid green
-    (1.00, (0.15, 0.95, 0.30)),   # strong +GEX  -> bright green
+    (0.00, (0.50, 0.00, 0.00)),
+    (0.34, (0.86, 0.06, 0.06)),
+    (0.47, (0.10, 0.00, 0.00)),
+    (0.50, (0.00, 0.00, 0.00)),
+    (0.53, (0.00, 0.10, 0.00)),
+    (0.66, (0.10, 0.74, 0.18)),
+    (1.00, (0.02, 0.42, 0.06)),
 ])
 
+# ---- vs3d building blocks (ported verbatim from vs3d.py) ----------------------
 
-def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
-                                  title, band_pct=4.0, n_price=400, smooth=0.6,
-                                  cone_mode=True, cone_gain=4.5):
+WEIGHT_METHODS = ["oi", "volume", "oi_plus_flow", "flow_reset"]
+
+
+def weight_for_arrays(oi, vol, method):
+    """vs3d weight_for(): the 4 toggle-able weighting schemes."""
+    oi = np.nan_to_num(np.asarray(oi, float))
+    vol = np.nan_to_num(np.asarray(vol, float))
+    if method == "oi":
+        return np.where(oi > 0, oi, vol)
+    if method in ("volume", "flow_reset"):
+        return np.where(vol > 0, vol, oi)
+    if method == "oi_plus_flow":
+        return oi + vol
+    raise ValueError(method)
+
+
+def bs_gamma_grid(S, K, T, sig):
+    """vs3d bs_gamma: gamma re-evaluated over a price grid (no r term)."""
+    S = np.asarray(S, float); K = np.asarray(K, float)
+    T = max(float(T), 1e-9); sig = np.maximum(np.asarray(sig, float), 1e-4)
+    d1 = (np.log(S / K) + 0.5 * sig ** 2 * T) / (sig * np.sqrt(T))
+    return norm.pdf(d1) / (S * sig * np.sqrt(T))
+
+
+def vs3d_cone_profile(sim_legs, pg, t_expiry, method, smooth_sigma=2.5):
     """
-    Net-GEX field behind spot candles. y = price, green = +ve net GEX (dampening),
-    red = -ve (amplifying), black seam = the flip / vol trigger.
-      cone_mode=False : flat horizontal color-bands (net GEX painted at each price)
-      cone_mode=True  : vs3d tanh "cone" — each price level reaches horizontally in
-                        proportion to |net GEX|, tails coming in from the right edge,
-                        giving the tapering cone from the strike-view profile.
-    Per-strike structure (walls, pin) preserved (light smoothing only).
+    The vs3d profile: net dealer gamma AS IF spot were each grid price —
+      Σ_legs sign · w · bs_gamma(pg, K, T, iv) · 100 · pg
+    (a hedging-force map over price, not an interpolated strike histogram).
     """
-    import matplotlib.dates as mdates
+    K = np.array([s for s, _, _, _, _ in sim_legs], float)
+    IV = np.array([v for _, v, _, _, _ in sim_legs], float)
+    OI = np.array([o for _, _, o, _, _ in sim_legs], float)
+    VOL = np.array([vl for _, _, _, vl, _ in sim_legs], float)
+    SGN = np.array([g for _, _, _, _, g in sim_legs], float)
+    w = weight_for_arrays(OI, VOL, method) * SGN
+    S = pg[:, None]
+    g = bs_gamma_grid(S, K[None, :], t_expiry, IV[None, :])
+    prof = (g * w[None, :]).sum(1) * 100.0 * pg
+    return gaussian_filter1d(prof, smooth_sigma) if smooth_sigma > 0 else prof
 
-    # ---- Net GEX per strike -> price grid (minimal smoothing, keep the bumps) ----
-    ks = gex_df["strike"].to_numpy(dtype=float)
-    net = gex_df["net_gex"].to_numpy(dtype=float)
-    order = np.argsort(ks)
-    ks, net = ks[order], net[order]
 
-    lo = spot * (1 - band_pct / 100.0)
-    hi = spot * (1 + band_pct / 100.0)
-    # NOTE: the band is a true ZOOM around spot — far levels (e.g. a distant K*)
-    # no longer stretch the view; levels outside the band are simply not drawn.
-    # clamp to the strikes we actually have so we don't paint flat tails forever
-    lo = max(lo, ks.min()); hi = min(hi, ks.max())
+def field_from_profile(vals, n_x=360, gain=4.5, glow=True):
+    """vs3d field_from_profile (verbatim): tanh cone + magnitude glow."""
+    scale = np.percentile(np.abs(vals), 85) or 1.0
+    b = 0.5 + 0.5 * np.tanh(vals / scale)
+    b = gaussian_filter1d(b, 2.0)
+    xs = np.linspace(0, 1, n_x)
+    V = np.tanh(gain * (b[:, None] - xs[None, :]))
+    if glow:
+        cap = np.percentile(np.abs(vals), 97) or 1.0
+        mag = np.clip(np.abs(vals) / cap, 0, 1)
+        mag = gaussian_filter1d(mag, 2.0)
+        V = V * (0.55 + 0.45 * mag)[:, None]
+    return V, b
+
+
+def zero_crossings_grid(pg, vals):
+    """vs3d zero_crossings: linear-interpolated flip prices of the grid profile."""
+    s = np.sign(vals)
+    idx = np.where(np.diff(s) != 0)[0]
+    out = []
+    for i in idx:
+        y0, y1 = vals[i], vals[i + 1]
+        if y1 != y0:
+            out.append(pg[i] - y0 * (pg[i + 1] - pg[i]) / (y1 - y0))
+    return out
+
+
+def build_forward_gradient_figure(candles, sim_legs, t_expiry, spot, levels,
+                                  title, method="oi", band_pct=2.0, n_price=260,
+                                  smooth=2.5, cone_mode=True, cone_gain=4.5,
+                                  glow=True, tails_right=True):
+    """
+    VS3D gradient, rebuilt the vs3d way:
+      profile = Σ_legs sign · w(method) · bs_gamma(price_grid, K, T, iv) · 100 · pg
+      (net dealer gamma AS IF spot were each price — a hedging-force map),
+      then field_from_profile() (85th-pctile tanh cone + magnitude glow),
+      white dashed profile line, flips = grid-profile zero-crossings.
+    method ∈ {oi, volume, oi_plus_flow, flow_reset} (vs3d weight_for, toggle-able).
+    """
+    # ---- price grid: true zoom around spot ----
+    Kmin = min(s for s, *_ in sim_legs); Kmax = max(s for s, *_ in sim_legs)
+    lo = max(spot * (1 - band_pct / 100.0), Kmin)
+    hi = min(spot * (1 + band_pct / 100.0), Kmax)
     pg = np.linspace(lo, hi, n_price)
 
-    prof = np.interp(pg, ks, net, left=0.0, right=0.0)
-    if smooth and smooth > 0:
-        prof = gaussian_filter1d(prof, max(0.3, n_price * (smooth / 100.0)))
-
-    # ---- normalize about ZERO so the seam is exactly at net GEX = 0 (the flip) ----
-    scale = np.percentile(np.abs(prof), 98) or 1.0
-    col = np.clip(prof / scale, -1.0, 1.0)           # -1..1, 0 -> black seam
+    # ---- vs3d profile over the grid ----
+    prof = vs3d_cone_profile(sim_legs, pg, t_expiry, method, smooth_sigma=smooth)
 
     if cone_mode:
-        # vs3d field_from_profile: each price row "reaches" across x in proportion
-        # to |net GEX| -> tapering cone. A baseline tint floor keeps every row
-        # colored on its sign side (green above flip / red below) so there is no
-        # dead black space — the cone just brightens into the walls.
-        n_x = 360
-        mag = np.abs(col)                            # 0..1 reach per price row
-        xs = np.linspace(0.0, 1.0, n_x)
-        reach = np.clip(np.tanh(cone_gain * (mag[:, None] - xs[None, :])), 0.0, 1.0)
-        base = 0.20                                  # regime tint floor
-        intensity = base + (1.0 - base) * reach      # base..1
-        field = np.sign(col)[:, None] * intensity    # ±(base..1); sign=0 at seam
-        field = field[:, ::-1]                        # tails reach in from the RIGHT
+        field, b = field_from_profile(prof, n_x=360, gain=cone_gain, glow=glow)
+        if tails_right:
+            field = field[:, ::-1]
     else:
-        # flat color-bands; near-zero now maps to dark colour (not black) via cmap
+        scale = np.percentile(np.abs(prof), 98) or 1.0
+        col = np.clip(prof / scale, -1.0, 1.0)
         field = np.tile(col[:, None], (1, 8))
+        b = 0.5 + 0.5 * col
 
     # ---- compressed session x-axis: bar index (no overnight/weekend gaps),
     #      labels are IST timestamps of the bars ----
@@ -1135,12 +1183,21 @@ def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
     for i in np.where(days.ne(days.shift()))[0][1:]:
         ax.axvline(i - 0.5, color="#666666", ls=":", lw=0.8, alpha=0.6, zorder=4)
 
-    # ---- spot + flip + level lines, de-collided labels ----
+    # ---- vs3d white dashed profile line ----
+    if cone_mode:
+        frac = (1.0 - b) if tails_right else b        # mirror line with the field
+        ax.plot(x0 + frac * (x1 - x0), pg, color="white", lw=1.0, ls="--",
+                alpha=0.9, zorder=4)
+
+    # ---- spot + grid flips + level lines, de-collided labels ----
     from matplotlib.transforms import blended_transform_factory
     trans = blended_transform_factory(ax.transAxes, ax.transData)
     ax.axhline(spot, color="white", ls="--", lw=1.3, alpha=0.9, zorder=7)
-    if vol_trigger is not None and pg[0] <= vol_trigger <= pg[-1]:
-        ax.axhline(vol_trigger, color="#33aaff", ls="-", lw=1.6, alpha=0.95, zorder=7)
+    for fp in sorted(zero_crossings_grid(pg, prof), key=lambda v: abs(v - spot))[:2]:
+        ax.axhline(fp, color="#ffd166", lw=1.1, ls=(0, (6, 3)), alpha=0.9, zorder=7)
+        ax.text(0.004, fp, f"γ-flip {fp:,.0f}", transform=trans, va="center",
+                ha="left", fontsize=8, color="black", fontweight="bold", zorder=8,
+                bbox=dict(boxstyle="round,pad=0.2", fc="#ffd166", ec="none", alpha=0.9))
 
     placed = []
     for lbl, price, color, ls in sorted(
@@ -1290,9 +1347,9 @@ def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
     dhw = compute_downside_hedge_wall(gex_df, spot, gravity["put_wall"])
     K_star, F_at_Kstar, _ = find_optimal_strike_K_star(gex_df)
 
-    # --- per-strike legs for the forward-simulation gradient ---
-    # OI-weighted (NSE updates OI intraday), per-strike IV (NSE IV is in %, -> decimal),
-    # sign = +1 for calls, -1 for puts. Fallback IV when a strike has none.
+    # --- per-strike legs for the vs3d gradient ---
+    # (strike, iv_decimal, oi, volume, sign). NSE IV is %, -> decimal; fallback
+    # IV when a strike has none. sign = +1 calls / -1 puts.
     def _legs(df, sign):
         d = df[(df["strike"] >= strike_lo) & (df["strike"] <= strike_hi)]
         out = []
@@ -1301,9 +1358,10 @@ def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
             iv = iv / 100.0 if iv > 3 else iv          # 12.34% -> 0.1234
             if iv <= 0:
                 iv = fallback_iv
-            oi = rr["openInterest"]
-            if oi > 0 and iv > 0:
-                out.append((float(rr["strike"]), float(iv), float(oi), sign))
+            oi = float(rr["openInterest"] or 0)
+            vol = float(rr.get("totalTradedVolume", 0) or 0)
+            if iv > 0 and (oi > 0 or vol > 0):
+                out.append((float(rr["strike"]), float(iv), oi, vol, sign))
         return out
     sim_legs = _legs(calls, +1) + _legs(puts, -1)
 
@@ -1523,29 +1581,36 @@ else:
         ("K*",          res["K_star"],                                "#66ccff", ":"),
     ]
     cc1, cc2, cc3 = st.columns(3)
+    method = cc1.selectbox("Weight (vs3d)", WEIGHT_METHODS, index=0,
+                           help="oi: OI (fallback vol) · volume: today's traded vol "
+                                "(fallback OI) · oi_plus_flow: OI+vol · flow_reset: "
+                                "same as volume on a single snapshot")
     band = cc1.slider("Zoom: price band ±%", 0.5, 6.0, 2.0, step=0.25)
-    show_bars = cc1.slider("Zoom: show last N bars", 20, int(candle_bars), 
+    show_bars = cc2.slider("Zoom: show last N bars", 20, int(candle_bars),
                            min(120, int(candle_bars)), step=10)
-    smooth = cc2.slider("Smoothing (0 = raw per-strike bumps)", 0.0, 3.0, 0.6, step=0.1)
-    cone_on = cc3.checkbox("Cone mode (tapering glow)", value=True)
+    smooth = cc2.slider("Profile smoothing σ", 0.0, 6.0, 2.5, step=0.5)
+    cone_on = cc3.checkbox("Cone mode", value=True)
+    glow_on = cc3.checkbox("Glow (|profile| brightness)", value=True, disabled=not cone_on)
+    tails_right = cc3.checkbox("Tails from right", value=True, disabled=not cone_on)
     cone_gain = cc3.slider("Cone gain", 2.0, 8.0, 4.5, step=0.5, disabled=not cone_on)
     try:
         with st.spinner(f"Fetching {candle_bars} × {candle_interval} candles…"):
             candles = fetch_candles(tv_symbol, tv_exchange, tv,
                                     candle_interval, candle_bars, token)
         candles = candles.tail(int(show_bars))          # time zoom
-        title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX gradient  "
-                 f"| expiry {expiry}  |  {ist_str}")
+        title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX gradient "
+                 f"[{method}]  | expiry {expiry}  |  {ist_str}")
         figp = build_forward_gradient_figure(
-            candles, gex_df, spot, vol_trigger, levels, title,
-            band_pct=band, smooth=smooth, cone_mode=cone_on, cone_gain=cone_gain)
+            candles, res["sim_legs"], res["t_expiry"], spot, levels, title,
+            method=method, band_pct=band, smooth=smooth, cone_mode=cone_on,
+            cone_gain=cone_gain, glow=glow_on, tails_right=tails_right)
         st.pyplot(figp, use_container_width=True)
         plt.close(figp)
-        st.caption("Net-GEX field: green = +ve (dampening), red = −ve (amplifying), "
-                   "black seam = gamma flip / vol trigger. Cone mode = each price "
-                   "reaches horizontally in proportion to |net GEX| (tails from the "
-                   "right). Walls/pin preserved; candles overlaid. Calls-plus / "
-                   "puts-minus convention, not participant-signed.")
+        st.caption("vs3d construction: profile = Σ sign·w·BS-gamma(price, K, T, iv)"
+                   "·100·P over the price grid (hedging force AS IF spot were each "
+                   "price), tanh cone + |profile| glow, white dashed profile line, "
+                   "γ-flips = grid zero-crossings. Weight method toggles between "
+                   "the 4 vs3d schemes. Calls-plus / puts-minus convention.")
     except Exception as e:
         st.error(f"Could not build gradient view: {e}")
 
