@@ -1131,6 +1131,43 @@ _GEX_CMAP = LinearSegmentedColormap.from_list("vs3d_gex", [
 WEIGHT_METHODS = ["oi", "volume", "oi_plus_flow", "flow_reset"]
 
 
+# exact vs3d CHARM colormap — gold = put/−, blue = call/+
+_CHARM_CMAP = LinearSegmentedColormap.from_list("vs3d_charm", [
+    (0.00, (0.42, 0.24, 0.00)),
+    (0.34, (0.86, 0.58, 0.02)),
+    (0.47, (0.10, 0.06, 0.00)),
+    (0.50, (0.00, 0.00, 0.00)),
+    (0.53, (0.00, 0.05, 0.12)),
+    (0.66, (0.12, 0.52, 0.95)),
+    (1.00, (0.02, 0.22, 0.58)),
+])
+
+
+def bs_charm_grid(S, K, T, sig):
+    """vs3d bs_charm: dDelta/dt over a price grid (no r term)."""
+    S = np.asarray(S, float); K = np.asarray(K, float)
+    T = max(float(T), 1e-9); sig = np.maximum(np.asarray(sig, float), 1e-4)
+    sq = sig * np.sqrt(T)
+    d1 = (np.log(S / K) + 0.5 * sig ** 2 * T) / sq
+    d2 = d1 - sq
+    return norm.pdf(d1) * d2 / (2.0 * T)
+
+
+def vs3d_charm_profile(sim_legs, pg, t_expiry, method, smooth_sigma=2.5):
+    """Charm profile, same construction as the gamma cone:
+    Σ_legs sign · w · bs_charm(pg, K, T, iv) · 100 · pg."""
+    K = np.array([s for s, _, _, _, _ in sim_legs], float)
+    IV = np.array([v for _, v, _, _, _ in sim_legs], float)
+    OI = np.array([o for _, _, o, _, _ in sim_legs], float)
+    VOL = np.array([vl for _, _, _, vl, _ in sim_legs], float)
+    SGN = np.array([g for _, _, _, _, g in sim_legs], float)
+    w = weight_for_arrays(OI, VOL, method) * SGN
+    S = pg[:, None]
+    ch = bs_charm_grid(S, K[None, :], t_expiry, IV[None, :])
+    prof = (ch * w[None, :]).sum(1) * 100.0 * pg
+    return gaussian_filter1d(prof, smooth_sigma) if smooth_sigma > 0 else prof
+
+
 def weight_for_arrays(oi, vol, method):
     """vs3d weight_for(): the 4 toggle-able weighting schemes."""
     oi = np.nan_to_num(np.asarray(oi, float))
@@ -1200,13 +1237,17 @@ def zero_crossings_grid(pg, vals):
 def build_forward_gradient_figure(candles, sim_legs, t_expiry, spot, levels,
                                   title, method="oi", band_pct=2.0, n_price=260,
                                   smooth=2.5, cone_mode=True, cone_gain=4.5,
-                                  glow=True, tails_right=True):
+                                  glow=True, tails_right=True, show_charm=True):
     """
-    VS3D gradient, rebuilt the vs3d way:
-      profile = Σ_legs sign · w(method) · bs_gamma(price_grid, K, T, iv) · 100 · pg
-      (net dealer gamma AS IF spot were each price — a hedging-force map),
+    VS3D gradient, rebuilt the vs3d way — now TWO stacked panels:
+      top    : net GAMMA cone (red/green, black seam)      — hedging force map
+      bottom : net CHARM cone (gold=put/−, blue=call/+)    — dDelta/dt drift map
+    Both from the same legs (so the dealer sign — convention or quadrant —
+    applies to charm too):
+      profile = Σ_legs sign · w(method) · bs_greek(price_grid, K, T, iv) · 100 · pg
       then field_from_profile() (85th-pctile tanh cone + magnitude glow),
-      white dashed profile line, flips = grid-profile zero-crossings.
+      white dashed profile line, flips = grid-profile zero-crossings
+      (γ-flips gold on top panel; charm-flips purple on bottom, per vs3d).
     method ∈ {oi, volume, oi_plus_flow, flow_reset} (vs3d weight_for, toggle-able).
     """
     # ---- price grid: true zoom around spot ----
@@ -1215,87 +1256,117 @@ def build_forward_gradient_figure(candles, sim_legs, t_expiry, spot, levels,
     hi = min(spot * (1 + band_pct / 100.0), Kmax)
     pg = np.linspace(lo, hi, n_price)
 
-    # ---- vs3d profile over the grid ----
-    prof = vs3d_cone_profile(sim_legs, pg, t_expiry, method, smooth_sigma=smooth)
+    # ---- vs3d profiles over the grid ----
+    prof_g = vs3d_cone_profile(sim_legs, pg, t_expiry, method, smooth_sigma=smooth)
+    prof_c = (vs3d_charm_profile(sim_legs, pg, t_expiry, method, smooth_sigma=smooth)
+              if show_charm else None)
 
-    if cone_mode:
-        field, b = field_from_profile(prof, n_x=360, gain=cone_gain, glow=glow)
-        if tails_right:
-            field = field[:, ::-1]
-    else:
-        scale = np.percentile(np.abs(prof), 98) or 1.0
-        col = np.clip(prof / scale, -1.0, 1.0)
-        field = np.tile(col[:, None], (1, 8))
-        b = 0.5 + 0.5 * col
+    def _field(prof):
+        if cone_mode:
+            V, b = field_from_profile(prof, n_x=360, gain=cone_gain, glow=glow)
+            if tails_right:
+                V = V[:, ::-1]
+        else:
+            scale = np.percentile(np.abs(prof), 98) or 1.0
+            col = np.clip(prof / scale, -1.0, 1.0)
+            V = np.tile(col[:, None], (1, 8))
+            b = 0.5 + 0.5 * col
+        return V, b
 
-    # ---- compressed session x-axis: bar index (no overnight/weekend gaps),
-    #      labels are IST timestamps of the bars ----
+    Vg, bg = _field(prof_g)
+    if show_charm:
+        Vc, bc = _field(prof_c)
+
+    # ---- compressed session x-axis: bar index (no overnight/weekend gaps) ----
     idx = candles.index
     n_bars = len(idx)
     xc = np.arange(n_bars, dtype=float)
     x0, x1 = -0.5, n_bars - 0.5 if n_bars > 1 else 0.5
 
-    fig, ax = plt.subplots(figsize=(20, 10))
-    fig.patch.set_facecolor("black")
-    ax.set_facecolor("black")
-
-    ax.imshow(field, origin="lower", extent=[x0, x1, pg[0], pg[-1]], aspect="auto",
-              cmap=_GEX_CMAP, vmin=-1, vmax=1, interpolation="bilinear", zorder=0)
-
-    # ---- candles (unit spacing on the session index -> constant width) ----
     o = candles["open"].to_numpy(dtype=float)
     h = candles["high"].to_numpy(dtype=float)
     l = candles["low"].to_numpy(dtype=float)
     c = candles["close"].to_numpy(dtype=float)
     bw = 0.7
     wick_min = float(np.nanmean(h - l)) * 0.02 if len(h) else 0.01
-    for i in range(n_bars):
-        up = c[i] >= o[i]
-        body = "#f0f0f0" if up else "#151515"
-        edge = "#ffffff" if up else "#9a9a9a"
-        ax.plot([xc[i], xc[i]], [l[i], h[i]], color=edge, lw=0.7, zorder=5)
-        lo_b, hi_b = (o[i], c[i]) if up else (c[i], o[i])
-        ax.add_patch(plt.Rectangle((xc[i] - bw / 2, lo_b), bw,
-                                   max(hi_b - lo_b, wick_min),
-                                   facecolor=body, edgecolor=edge, lw=0.4, zorder=6))
+    day_breaks = np.where(pd.Series(idx.date).ne(pd.Series(idx.date).shift()))[0][1:]
 
-    # ---- day separators (session boundaries) ----
-    days = pd.Series(idx.date)
-    for i in np.where(days.ne(days.shift()))[0][1:]:
-        ax.axvline(i - 0.5, color="#666666", ls=":", lw=0.8, alpha=0.6, zorder=4)
-
-    # ---- vs3d white dashed profile line ----
-    if cone_mode:
-        frac = (1.0 - b) if tails_right else b        # mirror line with the field
-        ax.plot(x0 + frac * (x1 - x0), pg, color="white", lw=1.0, ls="--",
-                alpha=0.9, zorder=4)
-
-    # ---- spot + grid flips + level lines, de-collided labels ----
     from matplotlib.transforms import blended_transform_factory
-    trans = blended_transform_factory(ax.transAxes, ax.transData)
-    ax.axhline(spot, color="white", ls="--", lw=1.3, alpha=0.9, zorder=7)
-    for fp in sorted(zero_crossings_grid(pg, prof), key=lambda v: abs(v - spot))[:2]:
-        ax.axhline(fp, color="#ffd166", lw=1.1, ls=(0, (6, 3)), alpha=0.9, zorder=7)
-        ax.text(0.004, fp, f"γ-flip {fp:,.0f}", transform=trans, va="center",
-                ha="left", fontsize=8, color="black", fontweight="bold", zorder=8,
-                bbox=dict(boxstyle="round,pad=0.2", fc="#ffd166", ec="none", alpha=0.9))
 
-    placed = []
-    for lbl, price, color, ls in sorted(
-            [(a, p, cl, s) for (a, p, cl, s) in levels
-             if p is not None and np.isfinite(p) and pg[0] <= p <= pg[-1]],
-            key=lambda t: t[1]):
-        ax.axhline(price, color=color, ls=ls, lw=1.1, alpha=0.85, zorder=7)
-        if all(abs(price - q) > 0.0015 * spot for q in placed):
-            ax.text(0.004, price, f"{lbl} {price:,.0f}", transform=trans, va="center",
-                    ha="left", fontsize=8, color="white", fontweight="bold",
-                    bbox=dict(boxstyle="round,pad=0.2", fc=color, ec="none", alpha=0.85),
-                    zorder=8)
-            placed.append(price)
+    if show_charm:
+        fig, (axg, axch) = plt.subplots(2, 1, figsize=(20, 14), sharex=True,
+                                        gridspec_kw={"hspace": 0.04})
+        panels = [(axg, Vg, bg, prof_g, _GEX_CMAP, "#ffd166", "γ-flip", True),
+                  (axch, Vc, bc, prof_c, _CHARM_CMAP, "#9d4edd", "charm-flip", False)]
+    else:
+        fig, axg = plt.subplots(figsize=(20, 10))
+        panels = [(axg, Vg, bg, prof_g, _GEX_CMAP, "#ffd166", "γ-flip", True)]
+    fig.patch.set_facecolor("black")
 
-    ax.set_ylim(pg[0], pg[-1])
-    ax.set_xlim(x0, x1)
-    # IST tick labels on the session index; ~12 ticks, day change shows date
+    for ax, V, b, prof, cmap, flip_c, flip_name, is_top in panels:
+        ax.set_facecolor("black")
+        ax.imshow(V, origin="lower", extent=[x0, x1, pg[0], pg[-1]], aspect="auto",
+                  cmap=cmap, vmin=-1, vmax=1, interpolation="bilinear", zorder=0)
+
+        # candles (both panels — price context for the drift map too)
+        for i in range(n_bars):
+            up = c[i] >= o[i]
+            body = "#f0f0f0" if up else "#151515"
+            edge = "#ffffff" if up else "#9a9a9a"
+            ax.plot([xc[i], xc[i]], [l[i], h[i]], color=edge, lw=0.7, zorder=5)
+            lo_b, hi_b = (o[i], c[i]) if up else (c[i], o[i])
+            ax.add_patch(plt.Rectangle((xc[i] - bw / 2, lo_b), bw,
+                                       max(hi_b - lo_b, wick_min),
+                                       facecolor=body, edgecolor=edge, lw=0.4, zorder=6))
+        for i in day_breaks:
+            ax.axvline(i - 0.5, color="#666666", ls=":", lw=0.8, alpha=0.6, zorder=4)
+
+        # white dashed profile line
+        if cone_mode:
+            frac = (1.0 - b) if tails_right else b
+            ax.plot(x0 + frac * (x1 - x0), pg, color="white", lw=1.0, ls="--",
+                    alpha=0.9, zorder=4)
+
+        trans = blended_transform_factory(ax.transAxes, ax.transData)
+        ax.axhline(spot, color="white", ls="--", lw=1.3, alpha=0.9, zorder=7)
+
+        # flips of THIS panel's profile
+        for fp in sorted(zero_crossings_grid(pg, prof), key=lambda v: abs(v - spot))[:2]:
+            ax.axhline(fp, color=flip_c, lw=1.1, ls=(0, (6, 3)), alpha=0.9, zorder=7)
+            ax.text(0.004, fp, f"{flip_name} {fp:,.0f}", transform=trans, va="center",
+                    ha="left", fontsize=8, color="black", fontweight="bold", zorder=8,
+                    bbox=dict(boxstyle="round,pad=0.2", fc=flip_c, ec="none", alpha=0.9))
+
+        # GEX levels only on the gamma (top) panel to keep charm readable
+        if is_top:
+            placed = []
+            for lbl, price, color, ls in sorted(
+                    [(a, p, cl, s) for (a, p, cl, s) in levels
+                     if p is not None and np.isfinite(p) and pg[0] <= p <= pg[-1]],
+                    key=lambda t: t[1]):
+                ax.axhline(price, color=color, ls=ls, lw=1.1, alpha=0.85, zorder=7)
+                if all(abs(price - q) > 0.0015 * spot for q in placed):
+                    ax.text(0.004, price, f"{lbl} {price:,.0f}", transform=trans,
+                            va="center", ha="left", fontsize=8, color="white",
+                            fontweight="bold",
+                            bbox=dict(boxstyle="round,pad=0.2", fc=color, ec="none",
+                                      alpha=0.85), zorder=8)
+                    placed.append(price)
+
+        ax.set_ylim(pg[0], pg[-1])
+        ax.set_xlim(x0, x1)
+        ax.tick_params(colors="white")
+        ax.set_ylabel("Price", color="white", fontsize=12, fontweight="bold")
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#444444")
+        # panel tag
+        ax.text(0.995, 0.97, "GAMMA (red − / green +)" if is_top else
+                "CHARM (gold put− / blue call+)", transform=ax.transAxes,
+                ha="right", va="top", fontsize=10, fontweight="bold",
+                color="#cccccc", zorder=9)
+
+    # IST tick labels on the bottom axis only
+    ax_b = panels[-1][0]
     step = max(1, n_bars // 12)
     ticks = list(range(0, n_bars, step))
     labels = []
@@ -1307,18 +1378,17 @@ def build_forward_gradient_figure(candles, sim_legs, t_expiry, spot, levels,
             prev_day = d.date()
         else:
             labels.append(d.strftime("%H:%M"))
-    ax.set_xticks(ticks)
-    ax.set_xticklabels(labels)
-    for lab in ax.get_xticklabels():
+    ax_b.set_xticks(ticks)
+    ax_b.set_xticklabels(labels)
+    for lab in ax_b.get_xticklabels():
         lab.set_rotation(45); lab.set_ha("right"); lab.set_color("white"); lab.set_fontsize(8)
-    ax.tick_params(colors="white")
-    ax.set_ylabel("Price", color="white", fontsize=12, fontweight="bold")
-    ax.set_xlabel("Session time (IST, 09:15–15:30, gaps compressed)",
-                  color="white", fontsize=11, fontweight="bold")
-    ax.set_title(title, color="white", fontsize=12, fontweight="bold", loc="left")
-    for sp in ax.spines.values():
-        sp.set_edgecolor("#444444")
-    fig.tight_layout()
+    ax_b.set_xlabel("Session time (IST, 09:15–15:30, gaps compressed)",
+                    color="white", fontsize=11, fontweight="bold")
+    panels[0][0].set_title(title, color="white", fontsize=12, fontweight="bold", loc="left")
+    if show_charm:
+        fig.subplots_adjust(left=0.045, right=0.995, top=0.95, bottom=0.09, hspace=0.05)
+    else:
+        fig.tight_layout()
     return fig
 
 
@@ -1490,8 +1560,8 @@ def build_oi_flow_figure(flow, spot, n_strikes=16):
     fig.patch.set_facecolor("white")
     fig.subplots_adjust(wspace=0.02)
     mx = max(1.0, float(np.nanmax(np.abs(np.r_[t["ce_doi"], t["pe_doi"]]))))
-    for ax, leg, ttl in ((axp, "pe", "PUT  ΔOI (from open)"),
-                         (axc, "ce", "CALL  ΔOI (from open)")):
+    for ax, leg, ttl in ((axp, "pe", f"PUT  ΔOI (since 1st snap {flow['t0']})"),
+                         (axc, "ce", f"CALL  ΔOI (since 1st snap {flow['t0']})")):
         vals = t[f"{leg}_doi"].to_numpy(float)
         cols = [_dom_color(s) for s in t[f"{leg}_dom"]]
         ax.barh(ks, vals, height=34, color=cols, edgecolor="white", lw=0.5, zorder=3)
@@ -1658,7 +1728,9 @@ with st.sidebar:
     _snaps_all = st.session_state.setdefault("oi_snaps", {})
     _n_here = len(_snaps_all.get(expiry, []))
     st.caption(f"{_n_here} snapshot(s) for {expiry} · auto every ~3 min while "
-               "the app refreshes · reset on app restart")
+               "the app refreshes · unchanged chain (e.g. market closed) is "
+               "skipped · reset on app restart. For a true from-open picture "
+               "(and meaningful churn%), have the app running from 09:15.")
     sc1, sc2 = st.columns(2)
     snap_now = sc1.button("📸 Snapshot now", use_container_width=True)
     if sc2.button("🗑 Clear snaps", use_container_width=True):
@@ -1800,10 +1872,13 @@ if view == "OI flow (ΔOI · quadrant)":
     flow = compute_oi_flow(_snaps)
     if flow is None:
         st.info(f"Collecting OI snapshots for {expiry} — have "
-                f"{len(_snaps)}, need ≥ 2. One is taken automatically every "
-                "~3 minutes while the app refreshes (enable Auto-refresh, or "
-                "click 📸 Snapshot now in the sidebar after NSE's next OI "
-                "update). Snapshots are in-memory and reset on app restart.")
+                f"{len(_snaps)}, need ≥ 2. Snapshots are kept **per expiry** "
+                "(switching expiry starts a fresh set), and one is taken "
+                "automatically every ~3 minutes **only while the chain is "
+                "changing** — with the market closed the chain is frozen, so "
+                "the count won't grow until the next session. Leave the app "
+                "running with Auto-refresh from 09:15 for the full from-open "
+                "picture. In-memory: resets on app restart.")
     else:
         figf = build_oi_flow_figure(flow, spot)
         fc_, _ = st.columns([3, 1])
@@ -1886,6 +1961,7 @@ else:
     cone_on = cc3.checkbox("Cone mode", value=True)
     glow_on = cc3.checkbox("Glow (|profile| brightness)", value=True, disabled=not cone_on)
     tails_right = cc3.checkbox("Tails from right", value=True, disabled=not cone_on)
+    show_charm = cc3.checkbox("Charm panel (gold/blue)", value=True)
     cone_gain = cc3.slider("Cone gain", 2.0, 8.0, 4.5, step=0.5, disabled=not cone_on)
     try:
         with st.spinner(f"Fetching {candle_bars} × {candle_interval} candles…"):
@@ -1907,14 +1983,19 @@ else:
         figp = build_forward_gradient_figure(
             candles, legs_used, res["t_expiry"], spot, levels, title,
             method=method, band_pct=band, smooth=smooth, cone_mode=cone_on,
-            cone_gain=cone_gain, glow=glow_on, tails_right=tails_right)
+            cone_gain=cone_gain, glow=glow_on, tails_right=tails_right,
+            show_charm=show_charm)
         st.pyplot(figp, use_container_width=True)
         plt.close(figp)
-        st.caption("vs3d construction: profile = Σ sign·w·BS-gamma(price, K, T, iv)"
-                   "·100·P over the price grid (hedging force AS IF spot were each "
-                   "price), tanh cone + |profile| glow, white dashed profile line, "
-                   "γ-flips = grid zero-crossings. Weight method toggles between "
-                   "the 4 vs3d schemes. Calls-plus / puts-minus convention.")
+        st.caption("vs3d construction: profile = Σ sign·w·BS-greek(price, K, T, iv)"
+                   "·100·P over the price grid, tanh cone + |profile| glow, white "
+                   "dashed profile line, flips = grid zero-crossings. TOP = gamma "
+                   "(red −/green +, γ-flips gold). BOTTOM = charm = dDelta/dt "
+                   "(gold = put/− drift, blue = call/+ drift, charm-flips purple): "
+                   "which way delta bleeds as time passes → the intraday hedge-"
+                   "drift bias; strongest read 13:00–14:30 IST, last hour = pin "
+                   "regime. Same dealer sign (convention/quadrant) drives both. "
+                   "Calls-plus / puts-minus convention unless quadrant-signed.")
     except Exception as e:
         st.error(f"Could not build gradient view: {e}")
 
