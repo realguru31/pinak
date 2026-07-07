@@ -1309,6 +1309,114 @@ def build_positioning_ladder(gex_df, spot, vol_trigger, pin, levels,
     return fig
 
 
+# =============================================================================
+# OI FLOW  — live-OI ΔOI · churn · integrated quadrant sign layer
+# =============================================================================
+# NSE updates OI intraday (~3 min), which SPX can't do. Per the incorporation
+# spec:  weight/positions = live OI;  volume demoted to diagnostic
+# (churn = volume − |ΔOI|);  and the classic NSE quadrant per strike-leg per
+# interval:  OI↑+prem↓ = fresh writing · OI↑+prem↑ = fresh buying ·
+# OI↓+prem↓ = long unwind · OI↓+prem↑ = short covering.  Integrated from open
+# -> writer-vs-buyer dominance per strike.  CAVEAT (kept in UI): dominance is a
+# PRIOR, not clearing data — NSE writers are heterogeneous, not all delta-hedge.
+
+def compute_oi_flow(snaps, tick=0.05):
+    """
+    snaps: list of {"ts": str, "df": snap_frame} in time order (same expiry).
+    Returns per-strike table (ΔOI from open, churn, build ratio, quadrant
+    dominance per leg) + opening-persistence gauge. None if < 2 snapshots.
+    Hygiene per spec: premium moves within one tick ignored; ΔOI artifacts
+    smoothed by integrating across all intervals rather than trusting any one.
+    """
+    if len(snaps) < 2:
+        return None
+    first = snaps[0]["df"].set_index("strike")
+    last = snaps[-1]["df"].set_index("strike")
+    idx = last.index
+    zeros = lambda: pd.Series(0.0, index=idx)
+    W = {"ce": zeros(), "pe": zeros()}   # net writer pressure (writing − short-cover)
+    B = {"ce": zeros(), "pe": zeros()}   # net buyer pressure  (buying − long-unwind)
+    for prev, cur in zip(snaps[:-1], snaps[1:]):
+        a = prev["df"].set_index("strike").reindex(idx).fillna(0)
+        b = cur["df"].set_index("strike").reindex(idx).fillna(0)
+        for leg in ("ce", "pe"):
+            dOI = b[f"{leg}_oi"] - a[f"{leg}_oi"]
+            dP = b[f"{leg}_ltp"] - a[f"{leg}_ltp"]
+            add = dOI.clip(lower=0)
+            drop = (-dOI).clip(lower=0)
+            W[leg] += add.where(dP <= -tick, 0.0) - drop.where(dP >= tick, 0.0)
+            B[leg] += add.where(dP >= tick, 0.0) - drop.where(dP <= -tick, 0.0)
+    out = pd.DataFrame(index=idx)
+    f0 = first.reindex(idx).fillna(0)
+    for leg in ("ce", "pe"):
+        out[f"{leg}_doi"] = last[f"{leg}_oi"] - f0[f"{leg}_oi"]
+        out[f"{leg}_vol"] = last[f"{leg}_vol"]
+        out[f"{leg}_churn"] = (out[f"{leg}_vol"] - out[f"{leg}_doi"].abs()).clip(lower=0)
+        out[f"{leg}_build"] = np.where(out[f"{leg}_vol"] > 0,
+                                       out[f"{leg}_doi"].abs() / out[f"{leg}_vol"], 0.0)
+        tot = W[leg].abs() + B[leg].abs()
+        out[f"{leg}_dom"] = np.where(tot > 0, (W[leg] - B[leg]) / tot, 0.0)
+    # opening-persistence gauge: surviving vs newly-built book (CE+PE)
+    oi_open = f0[["ce_oi", "pe_oi"]].sum(axis=1)
+    oi_now = last[["ce_oi", "pe_oi"]].sum(axis=1)
+    surviving = float(np.minimum(oi_open, oi_now).sum())
+    new_built = float((oi_now - oi_open).clip(lower=0).sum())
+    pct_opening = surviving / (surviving + new_built) if (surviving + new_built) > 0 else 1.0
+    new_top = (oi_now - oi_open).clip(lower=0).sort_values(ascending=False).head(3)
+    return {"table": out.reset_index(), "pct_opening": pct_opening,
+            "new_top": new_top, "n_snaps": len(snaps),
+            "t0": snaps[0]["ts"], "t1": snaps[-1]["ts"]}
+
+
+def _dom_color(score):
+    if score >= 0.15:
+        return "#ff9f1c"     # writer-dominated (amber)
+    if score <= -0.15:
+        return "#2ec4b6"     # buyer-dominated (teal)
+    return "#8d99ae"         # neutral / mixed
+
+
+def build_oi_flow_figure(flow, spot, n_strikes=16):
+    """ΔOI-from-open ladder: PE bars left panel, CE right; bar colour = quadrant
+    dominance (amber writer / teal buyer / grey mixed); churn% annotated."""
+    t = flow["table"].copy()
+    t["dist"] = (t["strike"] - spot).abs()
+    t = t.nsmallest(n_strikes, "dist").sort_values("strike")
+    ks = t["strike"].to_numpy(float)
+    fig, (axp, axc) = plt.subplots(1, 2, figsize=(13, 9), sharey=True)
+    fig.patch.set_facecolor("white")
+    fig.subplots_adjust(wspace=0.02)
+    mx = max(1.0, float(np.nanmax(np.abs(np.r_[t["ce_doi"], t["pe_doi"]]))))
+    for ax, leg, ttl in ((axp, "pe", "PUT  ΔOI (from open)"),
+                         (axc, "ce", "CALL  ΔOI (from open)")):
+        vals = t[f"{leg}_doi"].to_numpy(float)
+        cols = [_dom_color(s) for s in t[f"{leg}_dom"]]
+        ax.barh(ks, vals, height=34, color=cols, edgecolor="white", lw=0.5, zorder=3)
+        ax.axvline(0, color="#333", lw=1.0, zorder=2)
+        for k, v, ch, vol in zip(ks, vals, t[f"{leg}_churn"], t[f"{leg}_vol"]):
+            pct = 100 * ch / vol if vol > 0 else 0
+            ax.text(v + (0.02 if v >= 0 else -0.02) * mx, k, f"{v:+,.0f}  ({pct:.0f}% churn)",
+                    va="center", ha="left" if v >= 0 else "right", fontsize=7, color="#333")
+        ax.set_xlim(-1.25 * mx, 1.25 * mx)
+        ax.axhline(spot, color="#c400c4", ls="--", lw=1.8, zorder=4)
+        ax.set_title(ttl, fontsize=11, fontweight="bold", loc="left")
+        ax.grid(True, axis="y", alpha=0.25, ls="--", lw=0.5)
+        for sp_ in ax.spines.values():
+            sp_.set_edgecolor("#bbbbbb")
+    axp.set_ylabel("Strike", fontsize=11, fontweight="bold")
+    axp.invert_xaxis()   # PE builds read leftward
+    import matplotlib.patches as mpatches
+    fig.legend(handles=[mpatches.Patch(color="#ff9f1c", label="writer-controlled (fresh writing / long-unwinds)"),
+                        mpatches.Patch(color="#2ec4b6", label="buyer-controlled (fresh buying / short-covering)"),
+                        mpatches.Patch(color="#8d99ae", label="mixed / neutral")],
+               loc="lower center", ncol=3, fontsize=8, frameon=False)
+    fig.suptitle(f"OI flow · {flow['n_snaps']} snapshots · {flow['t0']} → {flow['t1']}   |   "
+                 f"book = {flow['pct_opening']:.0%} opening + {1-flow['pct_opening']:.0%} new",
+                 fontsize=11, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.04, 1, 0.95])
+    return fig
+
+
 @st.cache_data(show_spinner=False)
 def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
                  strike_hi, token):
@@ -1365,12 +1473,24 @@ def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
         return out
     sim_legs = _legs(calls, +1) + _legs(puts, -1)
 
+    # --- compact per-strike snapshot frame (for OI-flow / quadrant view) ---
+    def _side(df, pref):
+        d = df[(df["strike"] >= strike_lo) & (df["strike"] <= strike_hi)]
+        return pd.DataFrame({
+            "strike": d["strike"].astype(float),
+            f"{pref}_oi": pd.to_numeric(d["openInterest"], errors="coerce").fillna(0),
+            f"{pref}_ltp": pd.to_numeric(d["lastPrice"], errors="coerce").fillna(0),
+            f"{pref}_vol": pd.to_numeric(d.get("totalTradedVolume", 0), errors="coerce").fillna(0),
+        }).groupby("strike", as_index=False).first()
+    snap_frame = pd.merge(_side(calls, "ce"), _side(puts, "pe"),
+                          on="strike", how="outer").fillna(0).sort_values("strike")
+
     return {
         "gex_df": gex_df, "t_expiry": t_expiry, "exp_label": exp_label,
         "iv_market": iv_market, "sig_up": sig_up, "sig_dn": sig_dn,
         "vol_trigger": vol_trigger, "gravity": gravity, "pin": pin,
         "fc": fc, "hw": hw, "dhw": dhw, "K_star": K_star, "F_at_Kstar": F_at_Kstar,
-        "sim_legs": sim_legs, "expiry_dt": expiry_dt,
+        "sim_legs": sim_legs, "expiry_dt": expiry_dt, "snap_frame": snap_frame,
     }
 
 
@@ -1430,6 +1550,17 @@ with st.sidebar:
 
     auto = st.checkbox("Auto-refresh", value=False)
     interval = st.slider("Auto-refresh every (sec)", 15, 300, 60, disabled=not auto)
+
+    st.subheader("OI snapshots (in-memory)")
+    _snaps_all = st.session_state.setdefault("oi_snaps", {})
+    _n_here = len(_snaps_all.get(expiry, []))
+    st.caption(f"{_n_here} snapshot(s) for {expiry} · auto every ~3 min while "
+               "the app refreshes · reset on app restart")
+    sc1, sc2 = st.columns(2)
+    snap_now = sc1.button("📸 Snapshot now", use_container_width=True)
+    if sc2.button("🗑 Clear snaps", use_container_width=True):
+        st.session_state["oi_snaps"] = {}
+        st.rerun()
 
 token = st.session_state["token"]
 
@@ -1543,14 +1674,50 @@ k2[5].metric("Downside HW", f"{dhw['downside_hedge_wall']:,.0f}" if dhw else "N/
 ist_str = (datetime.now(pytz.utc).astimezone(pytz.timezone("Asia/Kolkata"))
            .strftime("%d-%b-%Y %H:%M IST"))
 
+# ── OI snapshot bookkeeping (in-memory, per expiry) ─────────────────────────
+_snaps = st.session_state.setdefault("oi_snaps", {}).setdefault(expiry, [])
+_now_s = time.time()
+_due = (not _snaps) or (_now_s - _snaps[-1]["t"] >= 175)          # ~3-min cadence
+if snap_now or _due:
+    _new = res["snap_frame"]
+    _dup = (_snaps and _snaps[-1]["df"].equals(_new))             # unchanged chain
+    if not _dup:
+        _snaps.append({"t": _now_s, "ts": ist_str.split("|")[-1].strip()
+                       if "|" in ist_str else ist_str, "df": _new})
+        del _snaps[:-240]                                          # memory cap
+
 view = st.radio(
     "View",
     ["Gamma density (strike axis)", "Net-GEX gradient (price × candles)",
-     "Positioning ladder"],
+     "Positioning ladder", "OI flow (ΔOI · quadrant)"],
     horizontal=True,
 )
 
-if view == "Gamma density (strike axis)":
+if view == "OI flow (ΔOI · quadrant)":
+    flow = compute_oi_flow(_snaps)
+    if flow is None:
+        st.info(f"Collecting OI snapshots for {expiry} — have "
+                f"{len(_snaps)}, need ≥ 2. One is taken automatically every "
+                "~3 minutes while the app refreshes (enable Auto-refresh, or "
+                "click 📸 Snapshot now in the sidebar after NSE's next OI "
+                "update). Snapshots are in-memory and reset on app restart.")
+    else:
+        figf = build_oi_flow_figure(flow, spot)
+        fc_, _ = st.columns([3, 1])
+        with fc_:
+            st.pyplot(figf, use_container_width=True)
+        plt.close(figf)
+        if len(flow["new_top"]):
+            tops = " · ".join(f"{k:,.0f} (+{v:,.0f})" for k, v in flow["new_top"].items())
+            st.write(f"**New build concentrated at:** {tops}")
+        st.caption("ΔOI from the session's first snapshot; bar colour = integrated "
+                   "quadrant dominance (OI↑prem↓=writing, OI↑prem↑=buying, "
+                   "OI↓prem↑=short-cover, OI↓prem↓=unwind; ±1-tick premium moves "
+                   "ignored). churn% = (volume − |ΔOI|)/volume — high churn = "
+                   "scalper round-trips, low churn + big ΔOI = real positioning. "
+                   "Dominance is a PRIOR, not clearing data: NSE writers are "
+                   "heterogeneous and not all delta-hedge mechanically.")
+elif view == "Gamma density (strike axis)":
     fig = build_gamma_figure(
         gex_df, spot, res["K_star"], res["F_at_Kstar"],
         f"{tv_exchange}:{tv_symbol}", expiry, res["exp_label"], ist_str,
