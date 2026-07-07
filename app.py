@@ -562,12 +562,31 @@ _TV_INTERVALS = {
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_candles(symbol, exchange, _tv, interval_name, n_bars, token):
-    """OHLC candles for the price view (time-series) from tvdatafeed."""
+    """
+    OHLC candles from tvdatafeed for the price view.
+    tvdatafeed returns naive-UTC timestamps -> localize UTC, convert to IST,
+    drop tz, and keep only NSE market hours (09:15-15:30 IST) so the chart
+    doesn't render dead overnight/weekend space.
+    """
     from tvDatafeed import Interval
     iv = getattr(Interval, _TV_INTERVALS.get(interval_name, "in_15_minute"))
     df = _tv.get_hist(symbol=symbol, exchange=exchange, interval=iv, n_bars=n_bars)
     if df is None or df.empty:
         raise RuntimeError("tvdatafeed returned no candles.")
+    # UTC -> IST -> naive
+    idx = pd.DatetimeIndex(df.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+    df = df.copy()
+    df.index = idx
+    # keep NSE session bars only (daily bars pass through untouched)
+    if interval_name != "1 day":
+        t = df.index.time
+        import datetime as _dt
+        df = df[(t >= _dt.time(9, 15)) & (t <= _dt.time(15, 30))]
+    if df.empty:
+        raise RuntimeError("No in-session candles after IST filtering.")
     return df
 
 
@@ -1049,9 +1068,8 @@ def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
 
     lo = spot * (1 - band_pct / 100.0)
     hi = spot * (1 + band_pct / 100.0)
-    lvl = [p for _, p, _, _ in levels if p is not None and np.isfinite(p)]
-    if lvl:
-        lo = min(lo, min(lvl)); hi = max(hi, max(lvl))
+    # NOTE: the band is a true ZOOM around spot — far levels (e.g. a distant K*)
+    # no longer stretch the view; levels outside the band are simply not drawn.
     # clamp to the strikes we actually have so we don't paint flat tails forever
     lo = max(lo, ks.min()); hi = min(hi, ks.max())
     pg = np.linspace(lo, hi, n_price)
@@ -1081,12 +1099,12 @@ def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
         # flat color-bands; near-zero now maps to dark colour (not black) via cmap
         field = np.tile(col[:, None], (1, 8))
 
-    # ---- time extent from the candles ----
+    # ---- compressed session x-axis: bar index (no overnight/weekend gaps),
+    #      labels are IST timestamps of the bars ----
     idx = candles.index
-    xc = mdates.date2num(idx.to_pydatetime())
-    x0, x1 = float(xc[0]), float(xc[-1])
-    if x1 <= x0:
-        x1 = x0 + 1.0
+    n_bars = len(idx)
+    xc = np.arange(n_bars, dtype=float)
+    x0, x1 = -0.5, n_bars - 0.5 if n_bars > 1 else 0.5
 
     fig, ax = plt.subplots(figsize=(20, 10))
     fig.patch.set_facecolor("black")
@@ -1095,14 +1113,14 @@ def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
     ax.imshow(field, origin="lower", extent=[x0, x1, pg[0], pg[-1]], aspect="auto",
               cmap=_GEX_CMAP, vmin=-1, vmax=1, interpolation="bilinear", zorder=0)
 
-    # ---- candles (width from median bar spacing -> no overlap) ----
+    # ---- candles (unit spacing on the session index -> constant width) ----
     o = candles["open"].to_numpy(dtype=float)
     h = candles["high"].to_numpy(dtype=float)
     l = candles["low"].to_numpy(dtype=float)
     c = candles["close"].to_numpy(dtype=float)
-    bw = float(np.median(np.diff(xc))) * 0.7 if len(xc) > 1 else (x1 - x0) / 100.0
+    bw = 0.7
     wick_min = float(np.nanmean(h - l)) * 0.02 if len(h) else 0.01
-    for i in range(len(xc)):
+    for i in range(n_bars):
         up = c[i] >= o[i]
         body = "#f0f0f0" if up else "#151515"
         edge = "#ffffff" if up else "#9a9a9a"
@@ -1111,6 +1129,11 @@ def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
         ax.add_patch(plt.Rectangle((xc[i] - bw / 2, lo_b), bw,
                                    max(hi_b - lo_b, wick_min),
                                    facecolor=body, edgecolor=edge, lw=0.4, zorder=6))
+
+    # ---- day separators (session boundaries) ----
+    days = pd.Series(idx.date)
+    for i in np.where(days.ne(days.shift()))[0][1:]:
+        ax.axvline(i - 0.5, color="#666666", ls=":", lw=0.8, alpha=0.6, zorder=4)
 
     # ---- spot + flip + level lines, de-collided labels ----
     from matplotlib.transforms import blended_transform_factory
@@ -1134,13 +1157,26 @@ def build_forward_gradient_figure(candles, gex_df, spot, vol_trigger, levels,
 
     ax.set_ylim(pg[0], pg[-1])
     ax.set_xlim(x0, x1)
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b %H:%M"))
+    # IST tick labels on the session index; ~12 ticks, day change shows date
+    step = max(1, n_bars // 12)
+    ticks = list(range(0, n_bars, step))
+    labels = []
+    prev_day = None
+    for t in ticks:
+        d = idx[t]
+        if d.date() != prev_day:
+            labels.append(d.strftime("%d-%b %H:%M"))
+            prev_day = d.date()
+        else:
+            labels.append(d.strftime("%H:%M"))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(labels)
     for lab in ax.get_xticklabels():
         lab.set_rotation(45); lab.set_ha("right"); lab.set_color("white"); lab.set_fontsize(8)
     ax.tick_params(colors="white")
     ax.set_ylabel("Price", color="white", fontsize=12, fontweight="bold")
-    ax.set_xlabel("Time", color="white", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Session time (IST, 09:15–15:30, gaps compressed)",
+                  color="white", fontsize=11, fontweight="bold")
     ax.set_title(title, color="white", fontsize=12, fontweight="bold", loc="left")
     for sp in ax.spines.values():
         sp.set_edgecolor("#444444")
@@ -1487,7 +1523,9 @@ else:
         ("K*",          res["K_star"],                                "#66ccff", ":"),
     ]
     cc1, cc2, cc3 = st.columns(3)
-    band = cc1.slider("Price band ±%", 1.0, 6.0, 4.0, step=0.5)
+    band = cc1.slider("Zoom: price band ±%", 0.5, 6.0, 2.0, step=0.25)
+    show_bars = cc1.slider("Zoom: show last N bars", 20, int(candle_bars), 
+                           min(120, int(candle_bars)), step=10)
     smooth = cc2.slider("Smoothing (0 = raw per-strike bumps)", 0.0, 3.0, 0.6, step=0.1)
     cone_on = cc3.checkbox("Cone mode (tapering glow)", value=True)
     cone_gain = cc3.slider("Cone gain", 2.0, 8.0, 4.5, step=0.5, disabled=not cone_on)
@@ -1495,6 +1533,7 @@ else:
         with st.spinner(f"Fetching {candle_bars} × {candle_interval} candles…"):
             candles = fetch_candles(tv_symbol, tv_exchange, tv,
                                     candle_interval, candle_bars, token)
+        candles = candles.tail(int(show_bars))          # time zoom
         title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX gradient  "
                  f"| expiry {expiry}  |  {ist_str}")
         figp = build_forward_gradient_figure(
