@@ -61,6 +61,7 @@ FIELD_MAPPINGS = {
     "lastPrice":            "lastPrice",
     "changeinOpenInterest": "changeInOpenInterest",
     "totalTradedVolume":    "totalTradedVolume",
+    "change":               "premChange",   # premium change vs prev close
 }
 
 # Sole chain source: option-chain-v3. A call WITH a valid expiry returns both the
@@ -1474,12 +1475,16 @@ def build_positioning_ladder(gex_df, spot, vol_trigger, pin, levels,
 def compute_oi_flow(snaps, tick=0.05):
     """
     snaps: list of {"ts": str, "df": snap_frame} in time order (same expiry).
-    Returns per-strike table (ΔOI from open, churn, build ratio, quadrant
-    dominance per leg) + opening-persistence gauge. None if < 2 snapshots.
-    Hygiene per spec: premium moves within one tick ignored; ΔOI artifacts
-    smoothed by integrating across all intervals rather than trusting any one.
+    ΔOI source of truth = NSE's own `changeinOpenInterest` (OI now − prev-day
+    close == the opening book), so bars/churn are correct even if the app
+    started mid-session. Quadrant dominance is integrated as:
+      seed interval  : prev-close → FIRST snapshot, using NSE day-level
+                       (chgOI, premium chg) — the classic NSE quadrant read
+      + refinements  : snapshot-to-snapshot (dOI, dPrem) intervals (~3 min)
+    Works from a SINGLE snapshot (seed only); more snapshots sharpen it.
+    Premium moves within one tick ignored (artifact hygiene).
     """
-    if len(snaps) < 2:
+    if not snaps:
         return None
     first = snaps[0]["df"].set_index("strike")
     last = snaps[-1]["df"].set_index("strike")
@@ -1487,36 +1492,63 @@ def compute_oi_flow(snaps, tick=0.05):
     zeros = lambda: pd.Series(0.0, index=idx)
     W = {"ce": zeros(), "pe": zeros()}   # net writer pressure (writing − short-cover)
     B = {"ce": zeros(), "pe": zeros()}   # net buyer pressure  (buying − long-unwind)
+
+    def _accumulate(leg, dOI, dP):
+        add = dOI.clip(lower=0)
+        drop = (-dOI).clip(lower=0)
+        W[leg] += add.where(dP <= -tick, 0.0) - drop.where(dP >= tick, 0.0)
+        B[leg] += add.where(dP >= tick, 0.0) - drop.where(dP <= -tick, 0.0)
+
+    # ---- seed: prev-close -> first snapshot, from NSE day-level fields ----
+    f0 = first.reindex(idx).fillna(0)
+    for leg in ("ce", "pe"):
+        if f"{leg}_chgoi" in f0.columns:
+            _accumulate(leg, f0[f"{leg}_chgoi"], f0.get(f"{leg}_pchg", zeros()))
+
+    # ---- refinements: snapshot-to-snapshot intervals ----
     for prev, cur in zip(snaps[:-1], snaps[1:]):
         a = prev["df"].set_index("strike").reindex(idx).fillna(0)
         b = cur["df"].set_index("strike").reindex(idx).fillna(0)
         for leg in ("ce", "pe"):
-            dOI = b[f"{leg}_oi"] - a[f"{leg}_oi"]
-            dP = b[f"{leg}_ltp"] - a[f"{leg}_ltp"]
-            add = dOI.clip(lower=0)
-            drop = (-dOI).clip(lower=0)
-            W[leg] += add.where(dP <= -tick, 0.0) - drop.where(dP >= tick, 0.0)
-            B[leg] += add.where(dP >= tick, 0.0) - drop.where(dP <= -tick, 0.0)
+            _accumulate(leg, b[f"{leg}_oi"] - a[f"{leg}_oi"],
+                        b[f"{leg}_ltp"] - a[f"{leg}_ltp"])
+
     out = pd.DataFrame(index=idx)
-    f0 = first.reindex(idx).fillna(0)
+    seed_ok = True
     for leg in ("ce", "pe"):
-        out[f"{leg}_doi"] = last[f"{leg}_oi"] - f0[f"{leg}_oi"]
+        # ΔOI today: NSE's own field from the LATEST snapshot (authoritative)
+        if f"{leg}_chgoi" in last.columns:
+            out[f"{leg}_doi"] = last[f"{leg}_chgoi"]
+        else:                                   # legacy snaps fallback
+            out[f"{leg}_doi"] = last[f"{leg}_oi"] - f0[f"{leg}_oi"]
+            seed_ok = False
         out[f"{leg}_vol"] = last[f"{leg}_vol"]
         out[f"{leg}_churn"] = (out[f"{leg}_vol"] - out[f"{leg}_doi"].abs()).clip(lower=0)
         out[f"{leg}_build"] = np.where(out[f"{leg}_vol"] > 0,
                                        out[f"{leg}_doi"].abs() / out[f"{leg}_vol"], 0.0)
         tot = W[leg].abs() + B[leg].abs()
         out[f"{leg}_dom"] = np.where(tot > 0, (W[leg] - B[leg]) / tot, 0.0)
-    # opening-persistence gauge: surviving vs newly-built book (CE+PE)
-    oi_open = f0[["ce_oi", "pe_oi"]].sum(axis=1)
-    oi_now = last[["ce_oi", "pe_oi"]].sum(axis=1)
-    surviving = float(np.minimum(oi_open, oi_now).sum())
-    new_built = float((oi_now - oi_open).clip(lower=0).sum())
+
+    # opening-persistence: prev-close book = OI_now − chgOI (per NSE definition)
+    if all(c in last.columns for c in ("ce_chgoi", "pe_chgoi")):
+        chg_tot = last["ce_chgoi"] + last["pe_chgoi"]
+        oi_now = last[["ce_oi", "pe_oi"]].sum(axis=1)
+        open_book = oi_now - chg_tot
+        surviving = float(np.minimum(open_book, oi_now).clip(lower=0).sum())
+        new_built = float(chg_tot.clip(lower=0).sum())
+        new_by_strike = chg_tot.clip(lower=0).sort_values(ascending=False)
+    else:
+        oi_open = f0[["ce_oi", "pe_oi"]].sum(axis=1)
+        oi_now = last[["ce_oi", "pe_oi"]].sum(axis=1)
+        surviving = float(np.minimum(oi_open, oi_now).sum())
+        new_built = float((oi_now - oi_open).clip(lower=0).sum())
+        new_by_strike = (oi_now - oi_open).clip(lower=0).sort_values(ascending=False)
     pct_opening = surviving / (surviving + new_built) if (surviving + new_built) > 0 else 1.0
-    new_top = (oi_now - oi_open).clip(lower=0).sort_values(ascending=False).head(3)
     return {"table": out.reset_index(), "pct_opening": pct_opening,
-            "new_top": new_top, "n_snaps": len(snaps),
-            "t0": snaps[0]["ts"], "t1": snaps[-1]["ts"]}
+            "new_top": new_by_strike.head(3), "n_snaps": len(snaps),
+            "t0": snaps[0]["ts"], "t1": snaps[-1]["ts"], "seed_ok": seed_ok,
+            "prem_field_ok": bool((last.get("ce_pchg", pd.Series(0, index=idx)).abs().sum()
+                                   + last.get("pe_pchg", pd.Series(0, index=idx)).abs().sum()) > 0)}
 
 
 def quadrant_signed_legs(sim_legs, flow):
@@ -1560,8 +1592,8 @@ def build_oi_flow_figure(flow, spot, n_strikes=16):
     fig.patch.set_facecolor("white")
     fig.subplots_adjust(wspace=0.02)
     mx = max(1.0, float(np.nanmax(np.abs(np.r_[t["ce_doi"], t["pe_doi"]]))))
-    for ax, leg, ttl in ((axp, "pe", f"PUT  ΔOI (since 1st snap {flow['t0']})"),
-                         (axc, "ce", f"CALL  ΔOI (since 1st snap {flow['t0']})")):
+    for ax, leg, ttl in ((axp, "pe", "PUT  ΔOI today (NSE, vs prev close)"),
+                         (axc, "ce", "CALL  ΔOI today (NSE, vs prev close)")):
         vals = t[f"{leg}_doi"].to_numpy(float)
         cols = [_dom_color(s) for s in t[f"{leg}_dom"]]
         ax.barh(ks, vals, height=34, color=cols, edgecolor="white", lw=0.5, zorder=3)
@@ -1583,8 +1615,10 @@ def build_oi_flow_figure(flow, spot, n_strikes=16):
                         mpatches.Patch(color="#2ec4b6", label="buyer-controlled (fresh buying / short-covering)"),
                         mpatches.Patch(color="#8d99ae", label="mixed / neutral")],
                loc="lower center", ncol=3, fontsize=8, frameon=False)
-    fig.suptitle(f"OI flow · {flow['n_snaps']} snapshots · {flow['t0']} → {flow['t1']}   |   "
-                 f"book = {flow['pct_opening']:.0%} opening + {1-flow['pct_opening']:.0%} new",
+    depth = ("quadrant = day-level seed" if flow["n_snaps"] == 1
+             else f"quadrant = seed + {flow['n_snaps']-1} interval(s)")
+    fig.suptitle(f"OI flow · {flow['n_snaps']} snapshot(s) · {flow['t0']} → {flow['t1']} · {depth}"
+                 f"   |   book = {flow['pct_opening']:.0%} opening + {1-flow['pct_opening']:.0%} new",
                  fontsize=11, fontweight="bold")
     fig.tight_layout(rect=[0, 0.04, 1, 0.95])
     return fig
@@ -1654,6 +1688,8 @@ def run_analysis(_raw_json, expiry, spot, fallback_iv, rv, risk_free, strike_lo,
             f"{pref}_oi": pd.to_numeric(d["openInterest"], errors="coerce").fillna(0),
             f"{pref}_ltp": pd.to_numeric(d["lastPrice"], errors="coerce").fillna(0),
             f"{pref}_vol": pd.to_numeric(d.get("totalTradedVolume", 0), errors="coerce").fillna(0),
+            f"{pref}_chgoi": pd.to_numeric(d.get("changeInOpenInterest", 0), errors="coerce").fillna(0),
+            f"{pref}_pchg": pd.to_numeric(d.get("premChange", 0), errors="coerce").fillna(0),
         }).groupby("strike", as_index=False).first()
     snap_frame = pd.merge(_side(calls, "ce"), _side(puts, "pe"),
                           on="strike", how="outer").fillna(0).sort_values("strike")
@@ -1871,15 +1907,14 @@ view = st.radio(
 if view == "OI flow (ΔOI · quadrant)":
     flow = compute_oi_flow(_snaps)
     if flow is None:
-        st.info(f"Collecting OI snapshots for {expiry} — have "
-                f"{len(_snaps)}, need ≥ 2. Snapshots are kept **per expiry** "
-                "(switching expiry starts a fresh set), and one is taken "
-                "automatically every ~3 minutes **only while the chain is "
-                "changing** — with the market closed the chain is frozen, so "
-                "the count won't grow until the next session. Leave the app "
-                "running with Auto-refresh from 09:15 for the full from-open "
-                "picture. In-memory: resets on app restart.")
+        st.info(f"No OI snapshot yet for {expiry} — one is taken on the first "
+                "successful chain fetch. Hit 🔄 Refresh data now.")
     else:
+        if not flow.get("prem_field_ok", True):
+            st.warning("NSE `change` (premium vs prev close) came back empty — "
+                       "day-level quadrant seed is neutral; intraday intervals "
+                       "still classify. Tell me if this persists and I'll "
+                       "re-verify the field name against the live v3 payload.")
         figf = build_oi_flow_figure(flow, spot)
         fc_, _ = st.columns([3, 1])
         with fc_:
@@ -1888,13 +1923,14 @@ if view == "OI flow (ΔOI · quadrant)":
         if len(flow["new_top"]):
             tops = " · ".join(f"{k:,.0f} (+{v:,.0f})" for k, v in flow["new_top"].items())
             st.write(f"**New build concentrated at:** {tops}")
-        st.caption("ΔOI from the session's first snapshot; bar colour = integrated "
-                   "quadrant dominance (OI↑prem↓=writing, OI↑prem↑=buying, "
-                   "OI↓prem↑=short-cover, OI↓prem↓=unwind; ±1-tick premium moves "
-                   "ignored). churn% = (volume − |ΔOI|)/volume — high churn = "
-                   "scalper round-trips, low churn + big ΔOI = real positioning. "
-                   "Dominance is a PRIOR, not clearing data: NSE writers are "
-                   "heterogeneous and not all delta-hedge mechanically.")
+        st.caption("ΔOI = NSE's `changeinOpenInterest` (today vs previous close "
+                   "= the opening book) — correct even if the app started mid-"
+                   "session. Bar colour = integrated quadrant dominance, seeded "
+                   "by the day-level (ΔOI × premium-chg) read and refined by "
+                   "~3-min snapshot intervals (OI↑prem↓=writing, OI↑prem↑=buying, "
+                   "OI↓prem↑=short-cover, OI↓prem↓=unwind; ±1-tick moves ignored). "
+                   "churn% = (volume − |ΔOI|)/volume — high churn = scalper "
+                   "round-trips. Dominance is a PRIOR, not clearing data.")
 
     # ---- participant-wise EOD prior (overnight calibration) ----
     st.markdown("---")
@@ -1976,8 +2012,9 @@ else:
             if ok:
                 sign_tag = f"quadrant·{flow_g['n_snaps']}snaps"
             else:
-                st.warning("Quadrant sign needs ≥2 OI snapshots — using the "
-                           "convention until they accumulate (~3 min apart).")
+                st.warning("Quadrant sign needs at least one OI snapshot — "
+                           "using the convention until the first chain fetch "
+                           "lands.")
         title = (f"{tv_exchange}:{tv_symbol}  ({candle_interval})  net-GEX gradient "
                  f"[{method} · {sign_tag}]  | expiry {expiry}  |  {ist_str}")
         figp = build_forward_gradient_figure(
